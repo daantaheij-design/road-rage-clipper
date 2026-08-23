@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Road Rage Clipper</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+    background: #0b0b0f; color: #f2f2f5; font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    padding: 24px;
+  }
+  form { width: 100%; max-width: 360px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: #9a9aa5; margin: 0 0 24px; font-size: 14px; }
+  input[type=password] {
+    width: 100%; padding: 14px 16px; font-size: 17px; border-radius: 12px;
+    border: 1px solid #2c2c34; background: #17171d; color: #fff; margin-bottom: 14px;
+  }
+  input[type=password]:focus { outline: 2px solid #ff3b5c; border-color: transparent; }
+  button {
+    width: 100%; padding: 14px 16px; font-size: 17px; font-weight: 600; border-radius: 12px;
+    border: none; background: #ff3b5c; color: #fff;
+  }
+  button:active { opacity: 0.85; }
+  .error { color: #ff5c5c; font-size: 14px; margin: -6px 0 14px; }
+</style>
+</head>
+<body>
+  <form method="post" action="/login">
+    <h1>🚗 Road Rage Clipper</h1>
+    <p class="sub">Private access only.</p>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password" required>
+    <button type="submit">Enter</button>
+  </form>
+</body>
+</html>

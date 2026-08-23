@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.jpeg
+*.png
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.DS_Store

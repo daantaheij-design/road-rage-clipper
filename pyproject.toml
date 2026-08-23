@@ -1,0 +1,10 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501: line length handled by formatter/reviewer, not worth failing CI over.
+# B008: function calls in argument defaults (Depends()/File()/Form()/Query())
+# are the standard FastAPI dependency-injection pattern, not a real bug.
+ignore = ["E501", "B008"]
