@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Private access
+    app_password: str = "change-me"
+    secret_key: str = "insecure-dev-secret-change-me"
+    mcp_api_key: str = "insecure-dev-mcp-key-change-me"
+
+    # Anthropic
+    anthropic_api_key: str = ""
+    claude_model: str = "claude-opus-5"
+
+    # ElevenLabs
+    elevenlabs_api_key: str = ""
+    elevenlabs_stt_model: str = "scribe_v2"
+    elevenlabs_tts_model: str = "eleven_multilingual_v2"
+    elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
+
+    # Storage
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket: str = "road-rage-clipper"
+    r2_endpoint_url: str = ""
+
+    # Local paths (used for scratch work always, and as storage fallback)
+    data_dir: str = "./data"
+
+    # Retention / limits
+    retention_hours: float = 48
+    max_video_mb: float = 500
+    max_video_duration_seconds: float = 1800
+    download_timeout_seconds: float = 600
+
+    # Misc
+    base_url: str = "http://localhost:8000"
+    port: int = 8000
+
+    @property
+    def data_path(self) -> Path:
+        p = Path(self.data_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def tmp_path(self) -> Path:
+        p = self.data_path / "tmp"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def local_storage_path(self) -> Path:
+        p = self.data_path / "storage"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_path / "jobs.db"
+
+    @property
+    def uses_r2(self) -> bool:
+        return bool(self.r2_account_id and self.r2_access_key_id and self.r2_secret_access_key)
+
+    @property
+    def resolved_r2_endpoint(self) -> str:
+        if self.r2_endpoint_url:
+            return self.r2_endpoint_url
+        return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    # Railway sets PORT at runtime; honor it if present and not overridden.
+    settings = Settings()
+    env_port = os.environ.get("PORT")
+    if env_port and settings.port == 8000:
+        try:
+            settings.port = int(env_port)
+        except ValueError:
+            pass
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    if railway_domain and settings.base_url == "http://localhost:8000":
+        settings.base_url = f"https://{railway_domain}"
+    return settings

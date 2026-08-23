@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Road Rage Clipper</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: #0b0b0f; color: #f2f2f5;
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    padding: max(20px, env(safe-area-inset-top)) 18px calc(40px + env(safe-area-inset-bottom));
+  }
+  h1 { font-size: 21px; margin: 0 0 2px; }
+  p.sub { color: #9a9aa5; margin: 0 0 22px; font-size: 14px; }
+  .card { background: #17171d; border: 1px solid #26262e; border-radius: 16px; padding: 18px; margin-bottom: 16px; }
+  label { display: block; font-size: 13px; font-weight: 600; color: #b8b8c2; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tab-btn {
+    flex: 1; padding: 10px; border-radius: 10px; border: 1px solid #2c2c34; background: #101014;
+    color: #9a9aa5; font-size: 14px; font-weight: 600;
+  }
+  .tab-btn.active { background: #ff3b5c; color: #fff; border-color: transparent; }
+  input[type=url], input[type=number] {
+    width: 100%; padding: 13px 14px; font-size: 16px; border-radius: 12px;
+    border: 1px solid #2c2c34; background: #101014; color: #fff;
+  }
+  input[type=file] {
+    width: 100%; padding: 12px; font-size: 14px; color: #cfcfd6;
+    border: 1px dashed #3a3a44; border-radius: 12px; background: #101014;
+  }
+  .stepper { display: flex; align-items: center; gap: 14px; }
+  .stepper button {
+    width: 42px; height: 42px; border-radius: 10px; border: 1px solid #2c2c34; background: #101014;
+    color: #fff; font-size: 20px; line-height: 1;
+  }
+  .stepper input { width: 60px; text-align: center; }
+  .hint { font-size: 12px; color: #6f6f7a; margin-top: 8px; }
+  button.primary {
+    width: 100%; padding: 16px; font-size: 17px; font-weight: 700; border-radius: 14px;
+    border: none; background: #ff3b5c; color: #fff; margin-top: 4px;
+  }
+  button.primary:disabled { background: #4a2530; color: #a5a5ac; }
+  button:active:not(:disabled) { opacity: 0.85; }
+  .hidden { display: none !important; }
+  .progress-wrap { background: #101014; border-radius: 10px; overflow: hidden; height: 10px; margin: 12px 0 8px; }
+  .progress-bar { height: 100%; background: #ff3b5c; width: 0%; transition: width 0.4s ease; }
+  .status-msg { font-size: 14px; color: #cfcfd6; }
+  .status-msg.error { color: #ff5c5c; }
+  .clip-card { border: 1px solid #26262e; border-radius: 16px; padding: 16px; margin-bottom: 14px; background: #131318; }
+  .clip-title { font-size: 16px; font-weight: 700; margin: 0 0 4px; }
+  .clip-score { display: inline-block; font-size: 12px; font-weight: 700; background: #2a1420; color: #ff8fa3; padding: 3px 9px; border-radius: 999px; margin-bottom: 8px; }
+  .clip-hook { font-style: italic; color: #e5c07b; font-size: 14px; margin: 0 0 8px; }
+  .clip-explain { font-size: 14px; color: #cfcfd6; margin: 0 0 10px; }
+  .clip-meta { font-size: 12px; color: #7d7d88; margin-bottom: 12px; }
+  a.download-btn {
+    display: block; text-align: center; padding: 13px; border-radius: 12px; background: #23232c;
+    color: #fff; font-weight: 700; text-decoration: none; font-size: 15px;
+  }
+  a.download-btn:active { opacity: 0.8; }
+  footer { text-align: center; margin-top: 28px; }
+  footer a { color: #6f6f7a; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>🚗 Road Rage Clipper</h1>
+  <p class="sub">Turn a road-rage video into TikTok-ready clips.</p>
+
+  <form id="job-form" class="card">
+    <div class="tabs">
+      <button type="button" class="tab-btn active" data-tab="file">Choose Video</button>
+      <button type="button" class="tab-btn" data-tab="url">Paste URL</button>
+    </div>
+
+    <div id="tab-file">
+      <label for="file">Video from Photos / Files</label>
+      <input type="file" id="file" name="file" accept="video/*">
+    </div>
+    <div id="tab-url" class="hidden">
+      <label for="video_url">Video URL</label>
+      <input type="url" id="video_url" name="video_url" placeholder="https://...">
+    </div>
+
+    <div style="height:16px"></div>
+    <label>Number of clips</label>
+    <div class="stepper">
+      <button type="button" id="dec">−</button>
+      <input type="number" id="number_of_clips" name="number_of_clips" value="3" min="{{ min_clips }}" max="{{ max_clips }}" readonly>
+      <button type="button" id="inc">+</button>
+    </div>
+    <p class="hint">Max upload size: {{ max_video_mb }} MB. Clips are auto-deleted after the configured retention period.</p>
+
+    <button type="submit" class="primary" id="generate-btn">Generate Clips</button>
+  </form>
+
+  <div id="progress-card" class="card hidden">
+    <div class="status-msg" id="status-msg">Starting…</div>
+    <div class="progress-wrap"><div class="progress-bar" id="progress-bar"></div></div>
+  </div>
+
+  <div id="results"></div>
+
+  <footer><a href="#" id="logout-link">Log out</a></footer>
+
+<script>
+(function () {
+  const tabButtons = document.querySelectorAll('.tab-btn');
+  const tabFile = document.getElementById('tab-file');
+  const tabUrl = document.getElementById('tab-url');
+  let activeTab = 'file';
+
+  tabButtons.forEach(btn => btn.addEventListener('click', () => {
+    tabButtons.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeTab = btn.dataset.tab;
+    tabFile.classList.toggle('hidden', activeTab !== 'file');
+    tabUrl.classList.toggle('hidden', activeTab !== 'url');
+  }));
+
+  const clipsInput = document.getElementById('number_of_clips');
+  const minClips = parseInt(clipsInput.min, 10), maxClips = parseInt(clipsInput.max, 10);
+  document.getElementById('dec').addEventListener('click', () => {
+    clipsInput.value = Math.max(minClips, parseInt(clipsInput.value, 10) - 1);
+  });
+  document.getElementById('inc').addEventListener('click', () => {
+    clipsInput.value = Math.min(maxClips, parseInt(clipsInput.value, 10) + 1);
+  });
+
+  const form = document.getElementById('job-form');
+  const generateBtn = document.getElementById('generate-btn');
+  const progressCard = document.getElementById('progress-card');
+  const statusMsg = document.getElementById('status-msg');
+  const progressBar = document.getElementById('progress-bar');
+  const results = document.getElementById('results');
+
+  let pollTimer = null;
+
+  function fmtTime(s) {
+    s = Math.round(s);
+    const m = Math.floor(s / 60), r = s % 60;
+    return m + ':' + String(r).padStart(2, '0');
+  }
+
+  function renderClips(clips) {
+    results.innerHTML = '';
+    clips.forEach((c, i) => {
+      const div = document.createElement('div');
+      div.className = 'clip-card';
+      const explain = c.explanation ? `<p class="clip-explain">${escapeHtml(c.explanation)}</p>` : '';
+      const hook = c.hook ? `<p class="clip-hook">"${escapeHtml(c.hook)}"</p>` : '';
+      const dl = c.download_url
+        ? `<a class="download-btn" href="${c.download_url}" download>⬇️ Download MP4</a>`
+        : `<div class="hint">Rendering…</div>`;
+      div.innerHTML = `
+        <div class="clip-score">Score ${c.score}/100</div>
+        <p class="clip-title">${i + 1}. ${escapeHtml(c.title || 'Clip')}</p>
+        ${hook}
+        ${explain}
+        <div class="clip-meta">${fmtTime(c.start_seconds)}–${fmtTime(c.end_seconds)} · ${Math.round(c.duration_seconds)}s</div>
+        ${dl}
+      `;
+      results.appendChild(div);
+    });
+  }
+
+  function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  async function poll(jobId) {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`);
+      if (!res.ok) throw new Error('status check failed');
+      const job = await res.json();
+      progressBar.style.width = job.progress + '%';
+      statusMsg.textContent = job.message || job.status;
+      statusMsg.classList.toggle('error', job.status === 'failed');
+
+      if (job.clips && job.clips.length) renderClips(job.clips);
+
+      if (job.status === 'completed') {
+        clearInterval(pollTimer);
+        generateBtn.disabled = false;
+        generateBtn.textContent = 'Generate More Clips';
+      } else if (job.status === 'failed') {
+        clearInterval(pollTimer);
+        generateBtn.disabled = false;
+        generateBtn.textContent = 'Try Again';
+        statusMsg.textContent = job.error || 'Something went wrong.';
+      }
+    } catch (e) {
+      // transient network hiccup - keep polling
+    }
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    generateBtn.disabled = true;
+    generateBtn.textContent = 'Uploading…';
+    results.innerHTML = '';
+    progressCard.classList.remove('hidden');
+    progressBar.style.width = '0%';
+    statusMsg.classList.remove('error');
+    statusMsg.textContent = 'Uploading…';
+
+    const fd = new FormData();
+    fd.append('number_of_clips', clipsInput.value);
+    if (activeTab === 'file') {
+      const f = document.getElementById('file').files[0];
+      if (!f) { alert('Choose a video first.'); generateBtn.disabled = false; generateBtn.textContent = 'Generate Clips'; return; }
+      fd.append('file', f);
+    } else {
+      const url = document.getElementById('video_url').value.trim();
+      if (!url) { alert('Paste a video URL first.'); generateBtn.disabled = false; generateBtn.textContent = 'Generate Clips'; return; }
+      fd.append('video_url', url);
+    }
+
+    try {
+      const res = await fetch('/api/jobs', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to start job');
+      generateBtn.textContent = 'Processing…';
+      statusMsg.textContent = 'Queued…';
+      pollTimer = setInterval(() => poll(data.job_id), 2500);
+      poll(data.job_id);
+    } catch (err) {
+      statusMsg.textContent = err.message;
+      statusMsg.classList.add('error');
+      generateBtn.disabled = false;
+      generateBtn.textContent = 'Generate Clips';
+    }
+  });
+
+  document.getElementById('logout-link').addEventListener('click', async (e) => {
+    e.preventDefault();
+    await fetch('/logout', { method: 'POST' });
+    window.location.href = '/login';
+  });
+})();
+</script>
+</body>
+</html>
