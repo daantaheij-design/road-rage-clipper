@@ -3,14 +3,31 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app.jobs.models import Job, JobStatus
+from app.jobs.store import get_job_store
+
+
+def _seed_job(job: Job) -> None:
+    # Plain sync sqlite write (JobStore._save_sync), not
+    # asyncio.run(store.save(...)): the app's background retention cleanup
+    # loop is alive on TestClient's own portal thread/loop for the duration
+    # of the `client` fixture and touches the same JobStore's asyncio.Lock -
+    # racing a second, independent event loop against it here can deadlock
+    # the lock hand-off across threads. Sync-only seeding sidesteps that.
+    get_job_store()._save_sync(job)
+
 
 @pytest.fixture
 def client(settings, monkeypatch):
     import app.main as main_mod
+    from app.jobs import service as job_service
 
     # Don't actually spin up the real FFmpeg/Claude/ElevenLabs pipeline from
-    # HTTP tests - just verify the web layer wires jobs correctly.
+    # HTTP tests - just verify the web layer wires jobs correctly. Both
+    # /api/jobs (main_mod) and /api/jobs/{id}/retry (via job_service) can
+    # trigger a background run, so both need patching.
     monkeypatch.setattr(main_mod, "enqueue_job", lambda job_id: None)
+    monkeypatch.setattr(job_service, "enqueue_job", lambda job_id: None)
 
     # Fresh app per test: the mounted MCP sub-app's session manager can only
     # be started once per instance, and each test needs its own settings
@@ -100,3 +117,51 @@ def test_mcp_requires_bearer_token(client):
 def test_files_route_rejects_bad_signature(client):
     resp = client.get("/files/jobs/x/clips/1.mp4", params={"exp": 9999999999, "sig": "bad"})
     assert resp.status_code == 403
+
+
+def test_retry_route_requires_auth(client):
+    resp = client.post("/api/jobs/some-id/retry")
+    assert resp.status_code == 401
+
+
+def test_retry_route_not_found(client):
+    client.post("/login", data={"password": "testpass"})
+    resp = client.post("/api/jobs/does-not-exist/retry")
+    assert resp.status_code == 404
+
+
+def test_retry_route_conflict_when_not_failed(client):
+    client.post("/login", data={"password": "testpass"})
+
+    job = Job(status=JobStatus.RENDERING)
+    _seed_job(job)
+
+    resp = client.post(f"/api/jobs/{job.id}/retry")
+    assert resp.status_code == 409
+
+
+def test_retry_route_resets_failed_job(client):
+    client.post("/login", data={"password": "testpass"})
+
+    job = Job(status=JobStatus.FAILED, error="boom", ready_to_render=True)
+    _seed_job(job)
+
+    resp = client.post(f"/api/jobs/{job.id}/retry")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["job_id"] == job.id
+    assert body["status"] == "queued"
+
+    status_resp = client.get(f"/api/jobs/{job.id}")
+    assert status_resp.json()["status"] == "queued"
+    assert status_resp.json()["error"] is None
+
+
+def test_job_status_reports_resumable_flag_when_failed_with_saved_analysis(client):
+    client.post("/login", data={"password": "testpass"})
+
+    job = Job(status=JobStatus.FAILED, ready_to_render=True)
+    _seed_job(job)
+
+    resp = client.get(f"/api/jobs/{job.id}")
+    assert resp.json()["resumable"] is True

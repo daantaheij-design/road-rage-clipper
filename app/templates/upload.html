@@ -42,6 +42,11 @@
     border: none; background: #ff3b5c; color: #fff; margin-top: 4px;
   }
   button.primary:disabled { background: #4a2530; color: #a5a5ac; }
+  button.secondary {
+    width: 100%; padding: 14px; font-size: 15px; font-weight: 700; border-radius: 12px;
+    border: 1px solid #3a3a44; background: #1c1c22; color: #fff; margin-top: 12px;
+  }
+  button.secondary:disabled { background: #17171b; color: #6f6f7a; border-color: #26262e; }
   button:active:not(:disabled) { opacity: 0.85; }
   .hidden { display: none !important; }
   .progress-wrap { background: #101014; border-radius: 10px; overflow: hidden; height: 10px; margin: 12px 0 8px; }
@@ -97,6 +102,7 @@
   <div id="progress-card" class="card hidden">
     <div class="status-msg" id="status-msg">Starting…</div>
     <div class="progress-wrap"><div class="progress-bar" id="progress-bar"></div></div>
+    <button type="button" class="secondary" id="retry-btn" hidden>Retry</button>
   </div>
 
   <div id="results"></div>
@@ -132,9 +138,18 @@
   const progressCard = document.getElementById('progress-card');
   const statusMsg = document.getElementById('status-msg');
   const progressBar = document.getElementById('progress-bar');
+  const retryBtn = document.getElementById('retry-btn');
   const results = document.getElementById('results');
 
   let pollTimer = null;
+  let currentJobId = null;
+
+  function startPolling(jobId) {
+    currentJobId = jobId;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => poll(jobId), 2500);
+    poll(jobId);
+  }
 
   function fmtTime(s) {
     s = Math.round(s);
@@ -185,16 +200,48 @@
         clearInterval(pollTimer);
         generateBtn.disabled = false;
         generateBtn.textContent = 'Generate More Clips';
+        retryBtn.hidden = true;
       } else if (job.status === 'failed') {
         clearInterval(pollTimer);
         generateBtn.disabled = false;
-        generateBtn.textContent = 'Try Again';
+        generateBtn.textContent = 'Start a New Job';
         statusMsg.textContent = job.error || 'Something went wrong.';
+        retryBtn.hidden = false;
+        retryBtn.disabled = false;
+        retryBtn.textContent = job.resumable
+          ? '🔁 Retry rendering (reuses saved AI analysis, no extra AI cost)'
+          : '🔁 Retry';
+      } else {
+        retryBtn.hidden = true;
       }
     } catch (e) {
       // transient network hiccup - keep polling
     }
   }
+
+  retryBtn.addEventListener('click', async () => {
+    if (!currentJobId) return;
+    retryBtn.disabled = true;
+    retryBtn.textContent = 'Retrying…';
+    statusMsg.classList.remove('error');
+    statusMsg.textContent = 'Retry queued…';
+    generateBtn.disabled = true;
+    generateBtn.textContent = 'Processing…';
+    try {
+      const res = await fetch(`/api/jobs/${currentJobId}/retry`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to retry job');
+      retryBtn.hidden = true;
+      startPolling(currentJobId);
+    } catch (err) {
+      statusMsg.textContent = err.message;
+      statusMsg.classList.add('error');
+      retryBtn.disabled = false;
+      retryBtn.textContent = '🔁 Retry';
+      generateBtn.disabled = false;
+      generateBtn.textContent = 'Start a New Job';
+    }
+  });
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -205,6 +252,7 @@
     progressBar.style.width = '0%';
     statusMsg.classList.remove('error');
     statusMsg.textContent = 'Uploading…';
+    retryBtn.hidden = true;
 
     const fd = new FormData();
     fd.append('number_of_clips', clipsInput.value);
@@ -224,8 +272,7 @@
       if (!res.ok) throw new Error(data.detail || 'Failed to start job');
       generateBtn.textContent = 'Processing…';
       statusMsg.textContent = 'Queued…';
-      pollTimer = setInterval(() => poll(data.job_id), 2500);
-      poll(data.job_id);
+      startPolling(data.job_id);
     } catch (err) {
       statusMsg.textContent = err.message;
       statusMsg.classList.add('error');

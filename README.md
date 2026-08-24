@@ -142,6 +142,14 @@ background and takes a few minutes, so don't expect an instant reply.
 All narration and captions describe only what's visibly happening ("the driver appears to brake
 sharply") - never claims about what someone was thinking or intending.
 
+**If rendering fails, retrying never re-runs the AI steps.** Transcription, visual analysis, story
+generation, and narration are the expensive, paid steps (Anthropic + ElevenLabs); rendering
+(ffmpeg) is the step most likely to fail, especially on a small container. Every expensive result
+is saved the moment it's produced, so if a job fails during/after rendering, the `/upload` page
+shows a **Retry render** button (and the MCP `retry_road_rage_job` tool does the same) that skips
+straight back to rendering - no Anthropic or ElevenLabs calls happen again, and any clips that
+already rendered successfully aren't re-rendered either.
+
 ---
 
 ## Local development

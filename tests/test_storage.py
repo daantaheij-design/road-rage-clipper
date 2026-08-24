@@ -53,3 +53,29 @@ def test_delete_and_delete_prefix(settings, tmp_path):
     assert not (settings.local_storage_path / "jobs/j1/clips/a.mp4").exists()
     assert not (settings.local_storage_path / "jobs/j1/clips/b.mp4").exists()
     assert (settings.local_storage_path / "jobs/j2/clips/c.mp4").exists()
+
+
+def test_download_file_round_trip(settings, tmp_path):
+    # This is what a job retry uses to pull previously-synthesized narration
+    # audio back down into a fresh local scratch directory.
+    storage = Storage(settings)
+    src = tmp_path / "narration.mp3"
+    src.write_bytes(b"synthesized narration audio bytes")
+    storage.upload_file(src, "jobs/j1/narration/clip1/0.mp3", content_type="audio/mpeg")
+
+    dest = tmp_path / "downloaded" / "0.mp3"
+    result = storage.download_file("jobs/j1/narration/clip1/0.mp3", dest)
+
+    assert result == dest
+    assert dest.read_bytes() == b"synthesized narration audio bytes"
+
+
+def test_download_file_creates_parent_dirs(settings, tmp_path):
+    storage = Storage(settings)
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"video bytes")
+    storage.upload_file(src, "jobs/j1/clips/a.mp4")
+
+    dest = tmp_path / "does" / "not" / "exist" / "yet" / "a.mp4"
+    storage.download_file("jobs/j1/clips/a.mp4", dest)
+    assert dest.read_bytes() == b"video bytes"

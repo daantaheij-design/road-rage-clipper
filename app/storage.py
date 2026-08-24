@@ -55,6 +55,19 @@ class Storage:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(local_path.read_bytes())
 
+    def download_file(self, key: str, dest_path: Path) -> Path:
+        """Fetch an object back down to local disk - used to reload
+        previously-uploaded narration audio (and similar) when resuming a
+        job whose local scratch directory is gone (retry after a restart,
+        or simply a fresh workdir)."""
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._s3:
+            self._s3.download_file(self.settings.r2_bucket, key, str(dest_path))
+        else:
+            src = self.settings.local_storage_path / key
+            dest_path.write_bytes(src.read_bytes())
+        return dest_path
+
     def delete(self, key: str) -> None:
         if self._s3:
             self._s3.delete_object(Bucket=self.settings.r2_bucket, Key=key)

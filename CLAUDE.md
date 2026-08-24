@@ -59,11 +59,44 @@ app/
    everything).
 6. `scoring.select_clips` ranks by total score and greedily picks the best non-overlapping set,
    clamping each clip into the 25-90s range (preferring 25-60s).
-7. Per selected clip: synthesize narration audio per cue (ElevenLabs TTS), build an .ass caption
-   file (original transcript captions everywhere narration *isn't* playing, narration captions
-   where it is, a hook title card at the very start), then render with `ffmpeg`: blurred/scaled
-   vertical composite + ducked-and-mixed audio + burned captions -> H.264/AAC MP4.
+7. Per selected clip: synthesize narration audio per cue (ElevenLabs TTS) and **upload it to
+   storage immediately** (see Resumability below), then build an .ass caption file (original
+   transcript captions everywhere narration *isn't* playing, narration captions where it is, a
+   hook title card at the very start), then render with `ffmpeg`: blurred/scaled vertical
+   composite + ducked-and-mixed audio + burned captions -> H.264/AAC MP4.
 8. Upload each clip to storage; job records get a `expires_at` (default 48h) for retention cleanup.
+
+### Resumability: retrying a failed job never repeats paid AI work
+
+Transcription (ElevenLabs) and visual analysis/story/narration (Anthropic + ElevenLabs TTS) are
+the expensive, paid steps - rendering (ffmpeg, see the memory-tuning notes below) is by far the
+most likely thing to fail, especially on a small container. So every expensive result is
+persisted the moment it succeeds, not just at the very end:
+
+- `Job.transcript_words` - the full ElevenLabs transcript, saved right after transcription.
+- `Job.clips[]` - one `Clip` per selected moment (title, scores, hook, explanation, start/end),
+  populated right after clip selection - **before** rendering starts.
+- `Clip.narration_cues[].audio_storage_key` - each cue's synthesized narration audio is uploaded
+  to storage (`jobs/{job_id}/narration/{clip_id}/{i}.mp3`) the moment ElevenLabs TTS returns it.
+- `Job.ready_to_render` - set `True` once all of the above has happened for every selected clip.
+
+`app/pipeline/pipeline.py::process_job` checks `ready_to_render` (and, as a smaller intermediate
+checkpoint, whether `transcript_words` is already populated) at the top of a run: if analysis is
+already done, it skips straight to rendering - no Anthropic/ElevenLabs calls happen at all. The
+render loop itself only processes clips that don't yet have a `storage_key` (i.e. didn't already
+render+upload successfully in a previous attempt), so a failure partway through a multi-clip job
+doesn't re-render clips that already finished. `_fetch_narration_tracks` always re-downloads
+narration audio from storage before rendering (rather than trusting local scratch files survived)
+so this works correctly even after a container restart, not just an in-process retry.
+
+`app/jobs/service.py::retry_job` is what flips a `FAILED` job back to `QUEUED` and re-enqueues it
+through the normal `enqueue_job` path - it's intentionally *not* a separate pipeline entry point,
+so "retry" and "first attempt" are exactly the same code path with the same resume checks. Only
+`FAILED` jobs can be retried (guards against kicking off a second concurrent run of an active
+job). Exposed as `POST /api/jobs/{job_id}/retry` and the `retry_road_rage_job` MCP tool; the
+`/upload` page shows a "Retry render" button whenever a job's status is `failed`, labelled
+differently when `resumable` (i.e. `ready_to_render`) is true so the user knows it won't re-run
+the AI steps.
 
 ### Two web surfaces, one job engine
 
@@ -154,4 +187,22 @@ locally (apt-get ffmpeg install, pip install -r requirements.txt) - verify with 
   by the same amount (`head_shift`) before overwriting `a.start_seconds` - if you touch either
   function, keep that shift in sync or narration will play at the wrong point in the rendered
   clip. Tail truncation (clip too long) doesn't need compensation since
-  `pipeline._render_selected_clip` already clamps each cue's start into `[0, clip.duration_seconds]`.
+  `pipeline._synthesize_and_store_narration` already clamps each cue's start into
+  `[0, clip.duration_seconds]` before it's ever persisted.
+- `render.py` deliberately caps ffmpeg/libx264 threading (`FFMPEG_THREADS`, default 2) and blurs
+  the background at a small internal resolution (`BG_BLUR_W`/`BG_BLUR_H`) before scaling back up
+  to 1080x1920 - small Railway containers report the *host's* full CPU count to ffmpeg, and an
+  unconstrained thread count plus a full-resolution `gblur` was enough to get the render process
+  OOM-killed (ffmpeg exits with return code -9). If you touch this file, keep the thread caps and
+  low-res blur; `ffmpeg_utils._describe_failure` gives OOM-killed renders (negative return code,
+  i.e. killed by signal) a distinct, clearly-labeled error message instead of a generic ffmpeg
+  failure - preserve that if you change error handling there.
+- `app/jobs/store.py::JobStore` uses an `asyncio.Lock` to serialize sqlite access. In production
+  that's always used from a single event loop (one uvicorn process), so it's fine - but in tests,
+  never seed/mutate job rows via `asyncio.run(get_job_store().save(...))` while a `TestClient` is
+  active: the app's background retention cleanup loop (started in `create_app()`'s lifespan) runs
+  on `TestClient`'s own portal thread/loop and touches the same lock, and racing a second,
+  independent event loop against it can deadlock the cross-thread lock hand-off (the test just
+  hangs forever, no exception). Seed test job rows with `get_job_store()._save_sync(job)` instead
+  - a plain synchronous sqlite write, no event loop involved. See `tests/test_api.py` and
+  `tests/test_mcp_server.py` for the pattern.
