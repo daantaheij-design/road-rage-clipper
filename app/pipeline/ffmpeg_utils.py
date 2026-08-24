@@ -9,10 +9,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Signals under which "the OS killed this process out from under us" is the
+# most likely explanation, rather than ffmpeg itself deciding to exit.
+# SIGKILL is what the Linux OOM killer sends; SIGBUS commonly shows up when
+# the kernel can't back a memory-mapped page (also often memory pressure).
+_LIKELY_OOM_SIGNALS = {signal.SIGKILL, signal.SIGBUS}
 
 
 class FFmpegError(RuntimeError):
@@ -38,10 +45,46 @@ async def _run(args: list[str], *, timeout: float = 900) -> str:
         raise FFmpegError(f"Command timed out after {timeout}s: {' '.join(args)}") from exc
 
     if proc.returncode != 0:
-        raise FFmpegError(
-            f"Command failed ({proc.returncode}): {' '.join(args)}\n{stderr.decode(errors='replace')[-4000:]}"
-        )
+        message = _describe_failure(proc.returncode, args, stderr)
+        # Log at error level here too (not just via the raised exception) so
+        # it's unmissable in a log aggregator that only surfaces top-level
+        # error-level lines rather than full exception tracebacks.
+        logger.error("ffmpeg command failed: %s", message)
+        raise FFmpegError(message)
     return stdout.decode(errors="replace")
+
+
+def _describe_failure(returncode: int, args: list[str], stderr: bytes) -> str:
+    tail = stderr.decode(errors="replace")[-4000:]
+
+    # On POSIX, a negative returncode means the process was killed by signal
+    # `-returncode` rather than exiting normally - ffmpeg never does this to
+    # itself, so it's the OS (almost always the kernel OOM killer for -9)
+    # terminating the process out from under us. A plain nonzero exit code
+    # with no signal is a normal ffmpeg-reported error (bad input, filter
+    # error, etc.) and gets no special framing.
+    if returncode < 0:
+        try:
+            sig = signal.Signals(-returncode)
+        except ValueError:
+            sig = None
+
+        if sig in _LIKELY_OOM_SIGNALS:
+            return (
+                f"ffmpeg was killed by signal {-returncode} ({sig.name if sig else 'unknown'}) - this almost "
+                "always means the process ran out of memory and the kernel's OOM killer terminated it (not a "
+                "normal ffmpeg error - there is little/no ffmpeg output below because the process was killed "
+                "outright). If this is running in a small/limited container, try lowering FFMPEG_THREADS "
+                f"further and/or reducing concurrent renders.\nCommand: {' '.join(args)}\n{tail}"
+            )
+        sig_desc = sig.name if sig else f"signal {-returncode}"
+        return (
+            f"ffmpeg was killed by {sig_desc} rather than exiting normally - possibly resource exhaustion "
+            f"(OOM, disk full, or the container/host killing it) rather than a normal ffmpeg error.\n"
+            f"Command: {' '.join(args)}\n{tail}"
+        )
+
+    return f"Command failed ({returncode}): {' '.join(args)}\n{tail}"
 
 
 @dataclass

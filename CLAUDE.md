@@ -155,3 +155,11 @@ locally (apt-get ffmpeg install, pip install -r requirements.txt) - verify with 
   function, keep that shift in sync or narration will play at the wrong point in the rendered
   clip. Tail truncation (clip too long) doesn't need compensation since
   `pipeline._render_selected_clip` already clamps each cue's start into `[0, clip.duration_seconds]`.
+- `render.py` deliberately caps ffmpeg/libx264 threading (`FFMPEG_THREADS`, default 2) and blurs
+  the background at a small internal resolution (`BG_BLUR_W`/`BG_BLUR_H`) before scaling back up
+  to 1080x1920 - small Railway containers report the *host's* full CPU count to ffmpeg, and an
+  unconstrained thread count plus a full-resolution `gblur` was enough to get the render process
+  OOM-killed (ffmpeg exits with return code -9). If you touch this file, keep the thread caps and
+  low-res blur; `ffmpeg_utils._describe_failure` gives OOM-killed renders (negative return code,
+  i.e. killed by signal) a distinct, clearly-labeled error message instead of a generic ffmpeg
+  failure - preserve that if you change error handling there.

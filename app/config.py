@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     max_video_duration_seconds: float = 1800
     download_timeout_seconds: float = 600
 
+    # FFmpeg encode/filter thread cap. Small Railway containers report the
+    # *host's* full CPU count (we've seen ffmpeg auto-detect 60 threads on a
+    # container with a fraction of that memory), so libx264's default
+    # thread-count auto-detection can spin up far more threads than the
+    # container can afford and get SIGKILLed by the OOM killer. 2 is a safe
+    # default that still parallelizes a bit without blowing up memory.
+    ffmpeg_threads: int = 2
+
     # Misc
     base_url: str = "http://localhost:8000"
     port: int = 8000
