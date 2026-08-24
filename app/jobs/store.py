@@ -58,6 +58,11 @@ class JobStore:
             return None
         return Job.model_validate_json(row[0])
 
+    def _list_recent_sync(self, limit: int) -> list[Job]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT data FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [Job.model_validate_json(r[0]) for r in rows]
+
     def _list_expired_sync(self, now: float | None = None) -> list[Job]:
         now = now if now is not None else time.time()
         with self._connect() as conn:
@@ -78,6 +83,14 @@ class JobStore:
     async def get(self, job_id: str) -> Job | None:
         async with self._lock:
             return await asyncio.to_thread(self._get_sync, job_id)
+
+    async def list_recent(self, limit: int = 10) -> list[Job]:
+        """Most recently created jobs, newest first. Used to restore the
+        /upload page's in-progress/finished job after a browser refresh -
+        this is a plain read against the same durable store the pipeline
+        already writes to, so it never triggers any AI/processing work."""
+        async with self._lock:
+            return await asyncio.to_thread(self._list_recent_sync, limit)
 
     async def list_expired(self) -> list[Job]:
         async with self._lock:

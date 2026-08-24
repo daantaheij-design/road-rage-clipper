@@ -56,3 +56,23 @@ async def test_list_expired_and_delete(tmp_path):
 
     await store.delete(expired.id)
     assert await store.get(expired.id) is None
+
+
+async def test_list_recent_returns_newest_first(tmp_path):
+    store = JobStore(tmp_path / "jobs.db")
+    older = Job(created_at=100.0)
+    newer = Job(created_at=200.0)
+    await store.save(older)
+    await store.save(newer)
+
+    recent = await store.list_recent(limit=10)
+    assert [j.id for j in recent] == [newer.id, older.id]
+
+
+async def test_list_recent_respects_limit(tmp_path):
+    store = JobStore(tmp_path / "jobs.db")
+    for i in range(5):
+        await store.save(Job(created_at=float(i)))
+
+    recent = await store.list_recent(limit=2)
+    assert len(recent) == 2

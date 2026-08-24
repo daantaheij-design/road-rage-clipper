@@ -70,6 +70,16 @@ async def test_retry_job_resets_failed_job_and_reenqueues(settings, monkeypatch)
     assert persisted.error is None
 
 
+async def test_list_recent_jobs_newest_first(settings):
+    older = Job(created_at=100.0)
+    newer = Job(created_at=200.0)
+    await get_job_store().save(older)
+    await get_job_store().save(newer)
+
+    jobs = await job_service.list_recent_jobs()
+    assert [j["job_id"] for j in jobs] == [newer.id, older.id]
+
+
 async def test_job_public_dict_resumable_flag(settings):
     job = Job(status=JobStatus.FAILED, ready_to_render=True)
     assert job.public_dict()["resumable"] is True

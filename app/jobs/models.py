@@ -19,6 +19,19 @@ class JobStatus(StrEnum):
     FAILED = "failed"
 
 
+class WordTimingRecord(BaseModel):
+    """Persisted per-word timing for one narration cue's synthesized audio
+    (from ElevenLabs' character-level alignment - see
+    app.pipeline.tts._characters_to_words). Relative to the start of that
+    cue's own audio clip, not the clip or the source video. Saved alongside
+    audio_storage_key so word-by-word captions survive a render-only retry
+    without ever calling ElevenLabs again."""
+
+    text: str
+    start: float
+    end: float
+
+
 class NarrationCue(BaseModel):
     beat: str  # hook | setup | escalation | main_event | payoff
     text: str
@@ -28,6 +41,89 @@ class NarrationCue(BaseModel):
     # uploaded as soon as it's generated. Lets a render-only retry reuse the
     # already-paid-for TTS audio instead of calling ElevenLabs again.
     audio_storage_key: str | None = None
+    word_timings: list[WordTimingRecord] = Field(default_factory=list)
+
+
+class CropKeyframe(BaseModel):
+    """One point in a clip's smart-crop pan plan - see app/pipeline/crop.py.
+    time_seconds is relative to the clip's own start (0 = clip start)."""
+
+    time_seconds: float
+    focus_x: float = 0.5
+    focus_y: float = 0.5
+    confidence: float = 0.0
+
+
+class BBox(BaseModel):
+    """Normalized (0-1) bounding box relative to the SOURCE frame Claude was
+    shown - not the cropped/output frame. See app/pipeline/geometry.py for
+    the source -> crop -> output pixel transform."""
+
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 0.02
+    height: float = 0.02
+
+    def clamped(self) -> BBox:
+        x = max(0.0, min(1.0, self.x))
+        y = max(0.0, min(1.0, self.y))
+        w = max(0.01, min(1.0, self.width))
+        h = max(0.01, min(1.0, self.height))
+        if x + w > 1.0:
+            x = max(0.0, 1.0 - w)
+        if y + h > 1.0:
+            y = max(0.0, 1.0 - h)
+        return BBox(x=x, y=y, width=w, height=h)
+
+
+class Target(BaseModel):
+    """The visual subject a circle/arrow/punch-zoom effect points at."""
+
+    description: str = ""
+    bbox: BBox | None = None
+    confidence: float = 0.0
+
+
+# Effects that only draw/zoom on top of the existing timeline (no change to
+# rendered duration) vs. effects that restructure the timeline itself.
+OVERLAY_EFFECT_TYPES = {"circle", "arrow", "punch_zoom"}
+TIMELINE_EFFECT_TYPES = {"freeze", "slow_motion", "replay"}
+EFFECT_TYPES = OVERLAY_EFFECT_TYPES | TIMELINE_EFFECT_TYPES
+
+
+class Effect(BaseModel):
+    """One visual-attention effect, in clip-relative seconds (0 = clip
+    start, matching narration_cues/crop_keyframes)."""
+
+    type: str  # circle | arrow | punch_zoom | freeze | slow_motion | replay
+    start_seconds: float = 0.0
+    end_seconds: float = 0.0
+    target: Target | None = None
+    zoom: float = 1.2  # punch_zoom only
+    speed: float = 0.6  # slow_motion/replay playback speed (1.0 = normal)
+
+
+class Teaser(BaseModel):
+    """Optional cold-open: a brief glimpse of a later moment in this same
+    clip's own footage, played before the normal chronological start. In
+    ABSOLUTE source-video seconds (unlike everything else on Clip, which is
+    clip-relative) since it's drawn from later in the clip's own window."""
+
+    enabled: bool = False
+    source_start: float = 0.0
+    source_end: float = 0.0
+
+
+class TimelineSegment(BaseModel):
+    """One piece of the final rendered timeline - persisted for
+    inspectability/debugging (see app/pipeline/timeline.py, which is the
+    authoritative, re-derived-at-render-time source of truth)."""
+
+    kind: str  # normal | freeze | slow_motion | replay | zoom | teaser
+    source_start: float = 0.0
+    source_end: float = 0.0
+    output_duration: float = 0.0
+    speed: float = 1.0
 
 
 class TranscriptWordRecord(BaseModel):
@@ -69,6 +165,11 @@ class Clip(BaseModel):
     duration_seconds: float = 0
     scores: ClipScores = Field(default_factory=ClipScores)
     narration_cues: list[NarrationCue] = Field(default_factory=list)
+    crop_keyframes: list[CropKeyframe] = Field(default_factory=list)
+    effects: list[Effect] = Field(default_factory=list)
+    teaser: Teaser | None = None
+    # Informational snapshot of the derived render plan - see TimelineSegment.
+    timeline_segments: list[TimelineSegment] = Field(default_factory=list)
     storage_key: str | None = None
     filename: str | None = None
 
@@ -83,6 +184,10 @@ class Clip(BaseModel):
             "end_seconds": round(self.end_seconds, 2),
             "duration_seconds": round(self.duration_seconds, 2),
             "download_url": download_url,
+            # Short labels for the UI's "Effects: Arrow · Punch Zoom" chip -
+            # not the full structured plan (that stays available server-side
+            # for debugging via the persisted Clip, not exposed over the API).
+            "effects": sorted({e.type for e in self.effects}),
         }
 
 
