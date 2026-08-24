@@ -93,14 +93,66 @@ async def test_synthesize_narration_writes_audio_and_returns_word_timings(settin
     assert all(isinstance(w, WordTiming) for w in result.words)
 
 
-async def test_synthesize_narration_handles_missing_alignment(settings, monkeypatch, tmp_path):
+async def test_synthesize_narration_falls_back_to_normalized_alignment(settings, monkeypatch, tmp_path):
+    """Regression: ElevenLabs applies text normalization server-side and
+    can return alignment=None with only normalized_alignment populated -
+    this must NOT be treated the same as "no alignment at all" (which
+    degrades to a whole-sentence caption block)."""
+    text = "Watch this now"
+
     def fake_convert_with_timestamps(**kwargs):
-        return SimpleNamespace(audio_base_64=base64.b64encode(b"x").decode("ascii"), alignment=None)
+        chars = list(text)
+        starts = [i * 0.08 for i in range(len(chars))]
+        ends = [s + 0.08 for s in starts]
+        normalized = SimpleNamespace(
+            characters=chars, character_start_times_seconds=starts, character_end_times_seconds=ends
+        )
+        return SimpleNamespace(
+            audio_base_64=base64.b64encode(b"x").decode("ascii"), alignment=None, normalized_alignment=normalized
+        )
 
     fake_client = SimpleNamespace(
         text_to_speech=SimpleNamespace(convert_with_timestamps=fake_convert_with_timestamps)
     )
     monkeypatch.setattr(tts_mod, "_client", lambda: fake_client)
 
-    result = await synthesize_narration("Hello", tmp_path / "out.mp3")
-    assert result.words == []
+    result = await synthesize_narration(text, tmp_path / "out.mp3")
+    assert [w.text for w in result.words] == ["Watch", "this", "now"]
+
+
+async def test_synthesize_narration_estimates_words_when_no_alignment_at_all(settings, monkeypatch, tmp_path):
+    """Neither alignment nor normalized_alignment present - must still
+    produce a strictly per-word breakdown (spec: never silently fall back
+    to a whole-sentence caption), not an empty word list."""
+
+    def fake_convert_with_timestamps(**kwargs):
+        return SimpleNamespace(
+            audio_base_64=base64.b64encode(b"x").decode("ascii"), alignment=None, normalized_alignment=None
+        )
+
+    fake_client = SimpleNamespace(
+        text_to_speech=SimpleNamespace(convert_with_timestamps=fake_convert_with_timestamps)
+    )
+    monkeypatch.setattr(tts_mod, "_client", lambda: fake_client)
+
+    result = await synthesize_narration("This driver got way too close", tmp_path / "out.mp3")
+    assert [w.text for w in result.words] == ["This", "driver", "got", "way", "too", "close"]
+    # Strictly increasing, non-overlapping - genuinely one word at a time.
+    for a, b in zip(result.words, result.words[1:], strict=False):
+        assert a.end <= b.start
+
+
+def test_estimate_word_timings_never_overlaps():
+    from app.pipeline.tts import _estimate_word_timings
+
+    timings = _estimate_word_timings("a short narration sentence about a close call", speed=1.0)
+    for a, b in zip(timings, timings[1:], strict=False):
+        assert a.end <= b.start
+
+
+def test_estimate_word_timings_respects_speed():
+    from app.pipeline.tts import _estimate_word_timings
+
+    normal = _estimate_word_timings("watch this driver", speed=1.0)
+    fast = _estimate_word_timings("watch this driver", speed=2.0)
+    assert fast[-1].end < normal[-1].end

@@ -384,3 +384,170 @@ async def test_retry_after_render_failure_with_effects_reuses_persisted_plan_and
     assert harness.last_render_kwargs["segments"] is not None
     assert harness.last_render_kwargs["overlays"] is not None
     assert len(harness.last_render_kwargs["overlays"]) == 1  # the circle overlay PNG was (re)generated locally
+
+
+def test_estimate_word_timings_for_duration_is_strictly_non_overlapping():
+    timings = pipeline._estimate_word_timings_for_duration("This driver got way too close", duration=3.0)
+    assert [w for w, _, _ in timings] == ["This", "driver", "got", "way", "too", "close"]
+    for (_, _, end_a), (_, start_b, _) in zip(timings, timings[1:], strict=False):
+        assert end_a <= start_b + 1e-9
+    assert timings[-1][2] == pytest.approx(3.0)
+
+
+def test_estimate_word_timings_for_duration_handles_empty_text():
+    assert pipeline._estimate_word_timings_for_duration("", duration=3.0) == []
+    assert pipeline._estimate_word_timings_for_duration("hello", duration=0.0) == []
+
+
+async def test_legacy_cue_without_word_timings_still_gets_word_by_word_captions(settings, harness, tmp_path):
+    """A cue persisted before the normalized_alignment fallback existed has
+    empty word_timings - a render (including a retry) must still produce
+    strictly per-word narration_words, never fall back to sentence
+    captions, and must never call ElevenLabs again to backfill them."""
+    from app.jobs.models import Clip, ClipScores, NarrationCue
+    from app.pipeline.render import NarrationTrack
+    from app.storage import get_storage
+
+    harness.render_should_fail = False
+
+    job = Job(number_of_clips=1, source_url="https://example.com/video.mp4", ready_to_render=True)
+    clip = Clip(
+        title="t",
+        score=80,
+        hook="h",
+        explanation="e",
+        start_seconds=0.0,
+        end_seconds=10.0,
+        duration_seconds=10.0,
+        scores=ClipScores(),
+        narration_cues=[
+            NarrationCue(beat="hook", text="This driver got way too close", start_seconds=0.0, audio_storage_key="k", word_timings=[])
+        ],
+    )
+    job.clips = [clip]
+    await get_job_store().save(job)
+
+    storage = get_storage()
+    audio_path = tmp_path / "narration.mp3"
+    audio_path.write_bytes(b"fake mp3 bytes")
+    storage.upload_file(audio_path, "k", content_type="audio/mpeg")
+
+    captured = {}
+    original = pipeline.captions_mod.build_ass_captions
+
+    def spy_build_ass_captions(**kwargs):
+        captured["narration_words"] = kwargs["narration_words"]
+        return original(**kwargs)
+
+    import app.pipeline.pipeline as pipeline_mod
+
+    orig_fn = pipeline_mod.captions_mod.build_ass_captions
+    pipeline_mod.captions_mod.build_ass_captions = spy_build_ass_captions
+    try:
+        tracks = [NarrationTrack(audio_path=audio_path, start_seconds=0.0, duration_seconds=3.0)]
+        clip_dir = tmp_path / "clipdir"
+        clip_dir.mkdir()
+        from app.pipeline.transcribe import Transcript as T
+
+        await pipeline_mod._render_and_upload_clip(
+            clip=clip,
+            source_path=tmp_path / "source.mp4",
+            media_info=_fake_media_info(),
+            transcript=T(text="", words=[]),
+            tracks=tracks,
+            clip_dir=clip_dir,
+            storage=storage,
+            job_id=job.id,
+        )
+    finally:
+        pipeline_mod.captions_mod.build_ass_captions = orig_fn
+
+    words = captured["narration_words"]
+    assert [w.text for w in words] == ["This", "driver", "got", "way", "too", "close"]
+    for a, b in zip(words, words[1:], strict=False):
+        assert a.end <= b.start
+    # No ElevenLabs call was made to backfill the missing alignment.
+    assert harness.calls["tts"] == 0
+
+
+async def test_analyze_uses_full_video_as_one_candidate_for_short_sources(settings, monkeypatch, tmp_path):
+    """Regression for the 45s->5s bug: pass 1 flagging only a narrow window
+    around the collision must not stop pass 2 from seeing the rest of a
+    short source video - _analyze should override pass 1's narrow windows
+    with a single full-video candidate when the source is short."""
+    from app.pipeline.ffmpeg_utils import Frame
+
+    async def fake_extract_frames(source_path, out_dir, *, fps, scale_width, prefix, start=0.0, duration=None):
+        return [Frame(timestamp=start, path=Path("/nonexistent.jpg"))]
+
+    seen_candidates = []
+
+    async def fake_scan_for_candidates(frames, transcript, **kwargs):
+        # Pass 1 only flags a narrow window right around the collision -
+        # nothing covering the confrontation that follows.
+        return [vision.CandidateWindow(start_seconds=10.0, end_seconds=16.0, suspicion=95, reasons=["collision"])]
+
+    async def fake_analyze_candidate(candidate, dense_frames, transcript, *, video_duration, **kwargs):
+        seen_candidates.append(candidate)
+        return None
+
+    monkeypatch.setattr(pipeline.ffmpeg_utils, "extract_frames", fake_extract_frames)
+    monkeypatch.setattr(pipeline.vision, "scan_for_candidates", fake_scan_for_candidates)
+    monkeypatch.setattr(pipeline.vision, "analyze_candidate", fake_analyze_candidate)
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    await pipeline._analyze(tmp_path / "source.mp4", workdir, video_duration=45.0, transcript=Transcript(text="", words=[]))
+
+    assert len(seen_candidates) == 1
+    assert seen_candidates[0].start_seconds == 0.0
+    assert seen_candidates[0].end_seconds == 45.0
+
+
+async def test_analyze_keeps_narrow_candidates_for_long_sources(settings, monkeypatch, tmp_path):
+    """Above the short-video threshold, pass 1's own (possibly multiple,
+    narrower) candidate windows are used as-is - a long video isn't
+    densely analyzed in full."""
+    from app.pipeline.ffmpeg_utils import Frame
+
+    async def fake_extract_frames(source_path, out_dir, *, fps, scale_width, prefix, start=0.0, duration=None):
+        return [Frame(timestamp=start, path=Path("/nonexistent.jpg"))]
+
+    seen_candidates = []
+
+    async def fake_scan_for_candidates(frames, transcript, **kwargs):
+        return [vision.CandidateWindow(start_seconds=100.0, end_seconds=110.0, suspicion=95, reasons=["moment"])]
+
+    async def fake_analyze_candidate(candidate, dense_frames, transcript, *, video_duration, **kwargs):
+        seen_candidates.append(candidate)
+        return None
+
+    monkeypatch.setattr(pipeline.ffmpeg_utils, "extract_frames", fake_extract_frames)
+    monkeypatch.setattr(pipeline.vision, "scan_for_candidates", fake_scan_for_candidates)
+    monkeypatch.setattr(pipeline.vision, "analyze_candidate", fake_analyze_candidate)
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    await pipeline._analyze(tmp_path / "source.mp4", workdir, video_duration=600.0, transcript=Transcript(text="", words=[]))
+
+    assert len(seen_candidates) == 1
+    assert seen_candidates[0].start_seconds == 100.0
+    assert seen_candidates[0].end_seconds == 110.0
+
+
+async def test_analysis_version_stamped_on_fresh_analysis(settings, harness):
+    harness.render_should_fail = False
+    job = Job(number_of_clips=1, source_url="https://example.com/video.mp4")
+    await get_job_store().save(job)
+    _place_fake_source(job.id)
+    await pipeline.process_job(job.id)
+
+    done = await get_job_store().get(job.id)
+    assert done.analysis_version == pipeline.ANALYSIS_VERSION
+    assert done.analysis_version > 0
+
+
+def test_job_defaults_to_version_zero_for_legacy_jobs():
+    job = Job()
+    assert job.analysis_version == 0
+    assert job.public_dict()["analysis_version"] == 0

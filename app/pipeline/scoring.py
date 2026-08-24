@@ -7,12 +7,20 @@ from app.pipeline.vision import MomentAnalysis
 
 # There is deliberately no "preferred" duration this module pushes clips
 # toward - the vision system prompt already instructs Claude to pick the
-# shortest duration that delivers a setup + event + payoff (roughly 8-45s
-# is preferred there, up to ~90s when genuinely needed). This module only
-# guards the extremes: a true floor so a degenerate near-zero-length
-# candidate can't reach rendering, and a ceiling so a runaway candidate
-# doesn't produce an unreasonably long "short-form" clip. It never stretches
-# a short, complete incident up to hit a target length.
+# shortest COMPLETE, satisfying story (not the shortest clip, period):
+# preserve a continuous incident (e.g. a collision immediately followed by
+# a confrontation) through its natural payoff rather than cutting away at
+# the single most dramatic frame - see incident_boundaries and
+# is_continuous_single_event in vision.py, which analyze_candidate itself
+# already enforces by widening end_seconds when a continuous event was cut
+# short. Roughly 8-45s is preferred, up to ~90s when the story genuinely
+# needs it. This module only guards the extremes: a true floor so a
+# degenerate near-zero-length candidate can't reach rendering, and a
+# ceiling so a runaway candidate doesn't produce an unreasonably long
+# "short-form" clip. It never stretches a short, complete incident up to
+# hit a target length, and it never shrinks a longer one either - only
+# _clamp_duration's HARD_MAX truncation reduces an already-chosen window,
+# and only when it exceeds the ceiling below.
 HARD_MIN_CLIP_SECONDS = 6
 HARD_MAX_CLIP_SECONDS = 90
 

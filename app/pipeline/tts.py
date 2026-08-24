@@ -6,19 +6,47 @@ returns character-level alignment (start/end time for every character
 spoken) alongside the audio, which is what makes word-by-word synced
 captions possible without a separate, expensive forced-alignment pass. See
 `_characters_to_words` for how that gets turned into word timings.
+
+`alignment` (timing against the original text) can legitimately come back
+None even on a successful call: ElevenLabs applies text normalization
+server-side (spelling out numbers, expanding abbreviations, etc. -
+`apply_text_normalization` defaults to "auto" and we don't override it),
+and when normalization changes the text, only `normalized_alignment`
+(timing against the *normalized* text) is populated. Checking only
+`alignment` silently produced an empty word list on every such cue in
+production, which made app.pipeline.captions fall back to a single
+whole-sentence caption for that cue - exactly the "not literally one word
+at a time" bug this fixes. Below, `alignment` is preferred when present
+(it matches Claude's original wording, which callers already have) and
+`normalized_alignment` is the fallback; if genuinely neither is present,
+`_estimate_word_timings` provides an approximate but still strictly
+per-word breakdown rather than ever handing back an empty word list.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 from elevenlabs.client import ElevenLabs
+from elevenlabs.types.character_alignment_response_model import CharacterAlignmentResponseModel
 from elevenlabs.types.voice_settings import VoiceSettings
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# Rough characters-per-second speaking pace at normal (1.0x) TTS speed, used
+# only by _estimate_word_timings - the rare fallback when ElevenLabs returns
+# neither alignment nor normalized_alignment. Not meant to be frame-exact,
+# just good enough that captions still land roughly on their words instead
+# of degrading to a whole-sentence block.
+_ESTIMATED_CHARS_PER_SECOND = 15.0
+_ESTIMATED_MIN_WORD_SECONDS = 0.15
+_ESTIMATED_WORD_GAP_SECONDS = 0.05
 
 
 @dataclass
@@ -65,6 +93,23 @@ def _characters_to_words(characters: list[str], starts: list[float], ends: list[
     return words
 
 
+def _estimate_word_timings(text: str, speed: float) -> list[WordTiming]:
+    """Approximate per-word timing when ElevenLabs returned no alignment at
+    all (neither original nor normalized) - proportional to word length at
+    a rough speaking pace, adjusted for the configured voice speed. Never
+    used when real alignment is available; exists so a caption is still
+    strictly one-word-at-a-time even in that rare case, instead of one
+    block of text for the whole cue."""
+    chars_per_second = _ESTIMATED_CHARS_PER_SECOND * max(0.5, speed)
+    timings: list[WordTiming] = []
+    t = 0.0
+    for word in text.split():
+        duration = max(_ESTIMATED_MIN_WORD_SECONDS, len(word) / chars_per_second)
+        timings.append(WordTiming(text=word, start=t, end=t + duration))
+        t += duration + _ESTIMATED_WORD_GAP_SECONDS
+    return timings
+
+
 def _synthesize_sync(text: str, out_path: Path, settings) -> NarrationAudio:
     client = _client()
     result = client.text_to_speech.convert_with_timestamps(
@@ -84,13 +129,20 @@ def _synthesize_sync(text: str, out_path: Path, settings) -> NarrationAudio:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(base64.b64decode(result.audio_base_64))
 
-    words: list[WordTiming] = []
-    if result.alignment is not None:
+    alignment: CharacterAlignmentResponseModel | None = result.alignment or result.normalized_alignment
+    if alignment is not None:
         words = _characters_to_words(
-            result.alignment.characters,
-            result.alignment.character_start_times_seconds,
-            result.alignment.character_end_times_seconds,
+            alignment.characters, alignment.character_start_times_seconds, alignment.character_end_times_seconds
         )
+    else:
+        logger.warning(
+            "ElevenLabs returned no character alignment (neither original nor normalized) for narration "
+            "text %r - using estimated word timings so captions still render one word at a time",
+            text,
+        )
+        words = []
+    if not words:
+        words = _estimate_word_timings(text, settings.elevenlabs_voice_speed)
 
     return NarrationAudio(audio_path=out_path, words=words)
 

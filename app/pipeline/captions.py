@@ -23,8 +23,11 @@ back to one whole-line Dialogue event per cue instead - see
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 MAX_WORDS_PER_PHRASE = 5
 MAX_PHRASE_SECONDS = 2.2
@@ -173,8 +176,19 @@ def build_ass_captions(
             end = min(clip_duration, w.end)
             lines.append(f"Dialogue: 1,{_fmt_time(start)},{_fmt_time(end)},{style},,0,0,0,,{_escape(w.text)}")
     else:
-        # No per-word alignment available for this cue (older job, or
-        # ElevenLabs returned none) - fall back to one line per cue.
+        # No per-word timing was handed to us at all - callers (pipeline.py)
+        # are expected to always estimate word-level timing rather than
+        # reach this branch (see tts.py's normalized_alignment fallback and
+        # pipeline.py's _estimate_word_timings_for_duration for legacy
+        # cues), so getting here means both of those were somehow skipped.
+        # Never silently render a whole-sentence block - log it loudly.
+        if narration_cues:
+            logger.warning(
+                "build_ass_captions received no narration_words for %d cue(s) - rendering whole-line "
+                "narration captions instead of word-by-word; this should not happen for a job produced "
+                "after tts.py's normalized_alignment fallback was added",
+                len(narration_cues),
+            )
         for start, end, text in narration_cues:
             if not text.strip():
                 continue

@@ -65,6 +65,31 @@ PASS2_FPS = 4.0
 PASS2_PAD_SECONDS = 6.0
 PASS2_CONCURRENCY = 3
 
+# For a short source video, don't let pass 1's sparse scan narrow what pass
+# 2 even gets to see: a dashcam collision followed by a confrontation can
+# look "suspicious" only around the impact to a coarse per-batch scan, and
+# padding a narrow candidate window by PASS2_PAD_SECONDS isn't enough to
+# recover a confrontation that runs on for another 20+ seconds. Below this
+# duration, pass 2 densely analyzes (close to) the whole video instead of
+# just padding around whatever pass 1 flagged - see _analyze.
+SHORT_VIDEO_FULL_ANALYSIS_SECONDS = 60.0
+
+# Cap on how many dense frames a single pass-2 call sends to Claude - a
+# full-video short-source analysis at PASS2_FPS could otherwise reach
+# hundreds of images in one request. Frame rate is reduced (never below
+# what a narrow, typical candidate window already used) to stay under this.
+MAX_DENSE_FRAMES = 150
+
+# Bumped whenever clip-selection/story-planning logic changes meaningfully
+# (see Job.analysis_version) - e.g. this version added incident_boundaries/
+# is_continuous_single_event enforcement so a continuous collision +
+# confrontation no longer collapses down to just the collision frame, full
+# dense analysis for short (<=60s) source videos, and the ElevenLabs
+# normalized_alignment fallback for word-by-word captions. Purely
+# informational on the Job - never used to auto-invalidate/re-run a
+# previously-analyzed job.
+ANALYSIS_VERSION = 2
+
 
 class PipelineError(Exception):
     pass
@@ -125,8 +150,21 @@ async def _analyze(
     candidates = await vision.scan_for_candidates(sparse_frames, transcript)
     logger.info("pass1 found %d candidate windows", len(candidates))
 
-    # Keep this bounded even on a long, noisy video.
-    candidates = sorted(candidates, key=lambda c: c.suspicion, reverse=True)[:20]
+    if video_duration <= SHORT_VIDEO_FULL_ANALYSIS_SECONDS:
+        # Don't let pass 1's window-narrowing hide the rest of a continuous
+        # incident (e.g. an argument that runs on after a collision) from
+        # pass 2 - densely analyze (almost) the whole video instead. Cheap
+        # to do for a short source either way, and it's exactly what let a
+        # 45s incident collapse down to a 5s collision-only clip: pass 2
+        # never even saw the confrontation footage in the first place.
+        reasons = [r for c in candidates for r in c.reasons] or ["short source video - analyzed in full"]
+        suspicion = max((c.suspicion for c in candidates), default=60)
+        candidates = [
+            vision.CandidateWindow(start_seconds=0.0, end_seconds=video_duration, suspicion=suspicion, reasons=reasons)
+        ]
+    else:
+        # Keep this bounded even on a long, noisy video.
+        candidates = sorted(candidates, key=lambda c: c.suspicion, reverse=True)[:20]
 
     sem = asyncio.Semaphore(PASS2_CONCURRENCY)
 
@@ -134,9 +172,11 @@ async def _analyze(
         async with sem:
             start = max(0.0, cand.start_seconds - PASS2_PAD_SECONDS)
             end = min(video_duration, cand.end_seconds + PASS2_PAD_SECONDS)
+            window = max(1e-6, end - start)
+            fps = min(PASS2_FPS, MAX_DENSE_FRAMES / window)
             dense_dir = workdir / f"frames_dense_{idx}"
             dense_frames = await ffmpeg_utils.extract_frames(
-                source_path, dense_dir, fps=PASS2_FPS, start=start, duration=end - start, scale_width=512, prefix="dense"
+                source_path, dense_dir, fps=fps, start=start, duration=end - start, scale_width=512, prefix="dense"
             )
             return await vision.analyze_candidate(cand, dense_frames, transcript, video_duration=video_duration)
 
@@ -239,6 +279,27 @@ async def _fetch_narration_tracks(clip: Clip, clip_dir: Path, storage: Storage) 
         duration = await ffmpeg_utils.duration_of(audio_path)
         tracks.append(NarrationTrack(audio_path=audio_path, start_seconds=cue.start_seconds, duration_seconds=duration))
     return tracks
+
+
+def _estimate_word_timings_for_duration(text: str, duration: float) -> list[tuple[str, float, float]]:
+    """Distribute a cue's words evenly (weighted by word length) across its
+    ACTUAL synthesized audio duration - used only for a legacy persisted
+    cue with no saved word_timings (see caller). More accurate than
+    tts.py's own estimate fallback since the real audio duration is known
+    here, and needs no ElevenLabs call. Returns (word, rel_start, rel_end)
+    relative to the cue's own audio start."""
+    text_words = text.split()
+    if not text_words or duration <= 0:
+        return []
+    weights = [len(w) + 1 for w in text_words]
+    total_weight = sum(weights)
+    out: list[tuple[str, float, float]] = []
+    t = 0.0
+    for word, weight in zip(text_words, weights, strict=True):
+        word_duration = duration * weight / total_weight
+        out.append((word, t, t + word_duration))
+        t += word_duration
+    return out
 
 
 def _augment_crop_keyframes_with_targets(clip: Clip, threshold: float) -> list[CropKeyframe]:
@@ -403,11 +464,29 @@ async def _render_and_upload_clip(
         (track.start_seconds, track.start_seconds + track.duration_seconds, cue.text)
         for cue, track in zip(clip.narration_cues, render_tracks, strict=False)
     ]
-    narration_words = [
-        captions_mod.Word(text=w.text, start=track.start_seconds + w.start, end=track.start_seconds + w.end)
-        for cue, track in zip(clip.narration_cues, render_tracks, strict=False)
-        for w in cue.word_timings
-    ]
+    narration_words: list[captions_mod.Word] = []
+    for cue, track in zip(clip.narration_cues, render_tracks, strict=False):
+        if cue.word_timings:
+            for w in cue.word_timings:
+                narration_words.append(
+                    captions_mod.Word(text=w.text, start=track.start_seconds + w.start, end=track.start_seconds + w.end)
+                )
+        elif cue.text.strip():
+            # Legacy persisted cue from before ElevenLabs' normalized_alignment
+            # fallback existed (see tts.py) - never re-call ElevenLabs on a
+            # retry, but still keep captions strictly one-word-at-a-time by
+            # estimating word timing from the cue's actual audio duration
+            # instead of silently falling back to a whole-sentence caption.
+            logger.warning(
+                "clip %s cue %r has no persisted word_timings (older job) - estimating word-level "
+                "captions from audio duration",
+                clip.id,
+                cue.beat,
+            )
+            for text_word, rel_start, rel_end in _estimate_word_timings_for_duration(cue.text, track.duration_seconds):
+                narration_words.append(
+                    captions_mod.Word(text=text_word, start=track.start_seconds + rel_start, end=track.start_seconds + rel_end)
+                )
     narration_words.sort(key=lambda w: w.start)
 
     ass_path = clip_dir / "captions.ass"
@@ -526,6 +605,7 @@ async def process_job(job_id: str) -> None:
                 job.clips.append(clip)
 
             job.ready_to_render = True
+            job.analysis_version = ANALYSIS_VERSION
             # Start this job's retention clock from the moment the costly AI
             # work is durably saved, so an abandoned failed job still
             # eventually gets cleaned up (along with its uploaded narration
