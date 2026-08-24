@@ -29,15 +29,31 @@ import time
 from pathlib import Path
 
 from app.config import get_settings
-from app.jobs.models import Clip, ClipScores, Job, JobStatus, NarrationCue, TranscriptWordRecord, WordTimingRecord
+from app.jobs.models import (
+    BBox,
+    Clip,
+    ClipScores,
+    Effect,
+    Job,
+    JobStatus,
+    NarrationCue,
+    Target,
+    Teaser,
+    TranscriptWordRecord,
+    WordTimingRecord,
+)
 from app.jobs.models import CropKeyframe as CropKeyframeRecord
+from app.jobs.models import TimelineSegment as TimelineSegmentRecord
 from app.jobs.store import get_job_store
 from app.pipeline import captions as captions_mod
 from app.pipeline import ffmpeg_utils, vision
-from app.pipeline.crop import CropKeyframe
+from app.pipeline.crop import CropKeyframe, crop_window_at
 from app.pipeline.download import DownloadError, download_video
-from app.pipeline.render import NarrationTrack, render_vertical_clip
+from app.pipeline.geometry import transform_bbox_to_output
+from app.pipeline.overlays import render_arrow_overlay, render_circle_overlay
+from app.pipeline.render import TARGET_H, TARGET_W, NarrationTrack, OverlaySpec, render_vertical_clip
 from app.pipeline.scoring import select_clips
+from app.pipeline.timeline import RenderPlan, SegmentPlan, build_render_plan
 from app.pipeline.transcribe import Transcript, TranscriptWord, transcribe_audio
 from app.pipeline.tts import synthesize_narration
 from app.storage import Storage, get_storage
@@ -128,7 +144,34 @@ async def _analyze(
     return [r for r in results if r is not None]
 
 
+def _build_effect(draft: vision.EffectDraft) -> Effect:
+    target = None
+    if draft.target is not None:
+        bbox = None
+        if draft.target.bbox is not None:
+            bbox = BBox(
+                x=draft.target.bbox.x,
+                y=draft.target.bbox.y,
+                width=draft.target.bbox.width,
+                height=draft.target.bbox.height,
+            ).clamped()
+        target = Target(description=draft.target.description, bbox=bbox, confidence=draft.target.confidence)
+    return Effect(
+        type=draft.type,
+        start_seconds=draft.start_seconds,
+        end_seconds=draft.end_seconds,
+        target=target,
+        zoom=draft.zoom,
+        speed=draft.speed,
+    )
+
+
 def _build_clip_from_analysis(analysis: vision.MomentAnalysis, clip_index: int) -> Clip:
+    teaser = None
+    if analysis.teaser is not None and analysis.teaser.enabled:
+        teaser = Teaser(
+            enabled=True, source_start=analysis.teaser.source_start, source_end=analysis.teaser.source_end
+        )
     return Clip(
         title=analysis.title,
         score=analysis.total_score,
@@ -144,6 +187,8 @@ def _build_clip_from_analysis(analysis: vision.MomentAnalysis, clip_index: int) 
             )
             for kf in analysis.crop_keyframes
         ],
+        effects=[_build_effect(e) for e in analysis.effects],
+        teaser=teaser,
         filename=f"road-rage-clip-{clip_index + 1}.mp4",
     )
 
@@ -196,6 +241,91 @@ async def _fetch_narration_tracks(clip: Clip, clip_dir: Path, storage: Storage) 
     return tracks
 
 
+def _augment_crop_keyframes_with_targets(clip: Clip, threshold: float) -> list[CropKeyframe]:
+    """Bias the base pan-crop plan toward a circle/arrow effect's target
+    around the moment it appears - see spec section 3: prefer adjusting the
+    smart crop to include the target over drawing an annotation on
+    footage where it isn't even visible."""
+    augmented = [
+        CropKeyframe(kf.time_seconds, kf.focus_x, kf.focus_y, kf.confidence) for kf in clip.crop_keyframes
+    ]
+    for effect in clip.effects:
+        if effect.type not in ("circle", "arrow") or effect.target is None or effect.target.bbox is None:
+            continue
+        if effect.target.confidence < threshold:
+            continue
+        mid = (effect.start_seconds + effect.end_seconds) / 2
+        b = effect.target.bbox.clamped()
+        augmented.append(CropKeyframe(mid, b.x + b.width / 2, b.y + b.height / 2, effect.target.confidence))
+    return augmented
+
+
+def _find_segment_for_time(plan: RenderPlan, abs_t: float) -> SegmentPlan | None:
+    for seg in plan.segments:
+        if seg.kind in ("normal", "slow_motion", "zoom") and seg.source_start <= abs_t <= seg.source_end:
+            return seg
+    return None
+
+
+def _build_overlay_specs(
+    clip: Clip, plan: RenderPlan, media_info: ffmpeg_utils.MediaInfo, clip_dir: Path, threshold: float
+) -> list[OverlaySpec]:
+    """Render a circle/arrow PNG (see app.pipeline.overlays) for every
+    circle/arrow effect whose target is confidently localized AND actually
+    visible in whatever crop window is active at that moment - never guess
+    at an off-screen position (spec: "prefer no annotation")."""
+    specs: list[OverlaySpec] = []
+    for i, effect in enumerate(clip.effects):
+        if effect.type not in ("circle", "arrow"):
+            continue
+        if effect.target is None or effect.target.bbox is None or effect.target.confidence < threshold:
+            continue
+
+        mid = (effect.start_seconds + effect.end_seconds) / 2
+        abs_mid = clip.start_seconds + mid
+        seg = _find_segment_for_time(plan, abs_mid)
+        if seg is None:
+            continue
+        local_t = (abs_mid - seg.source_start) / max(seg.speed, 1e-6)
+        crop_x, crop_y, crop_w, crop_h = crop_window_at(
+            seg.crop_keyframes,
+            local_t,
+            clip_duration=seg.output_duration,
+            source_width=media_info.width,
+            source_height=media_info.height,
+            target_width=TARGET_W,
+            target_height=TARGET_H,
+            zoom=seg.zoom,
+        )
+        rect = transform_bbox_to_output(
+            effect.target.bbox,
+            source_width=media_info.width,
+            source_height=media_info.height,
+            crop_x=crop_x,
+            crop_y=crop_y,
+            crop_w=crop_w,
+            crop_h=crop_h,
+            target_width=TARGET_W,
+            target_height=TARGET_H,
+        )
+        if rect is None:
+            continue  # target not usefully visible in this crop window - skip, don't guess
+
+        png_path = clip_dir / f"effect_{i}.png"
+        if effect.type == "circle":
+            render_circle_overlay(rect, png_path)
+        else:
+            render_arrow_overlay(rect, png_path)
+        specs.append(
+            OverlaySpec(
+                image_path=png_path,
+                start_seconds=plan.remap(effect.start_seconds),
+                end_seconds=plan.remap(effect.end_seconds),
+            )
+        )
+    return specs
+
+
 async def _render_and_upload_clip(
     *,
     clip: Clip,
@@ -207,21 +337,75 @@ async def _render_and_upload_clip(
     storage: Storage,
     job_id: str,
 ) -> None:
+    settings = get_settings()
+    has_effects = bool(clip.effects) or (clip.teaser is not None and clip.teaser.enabled)
+
+    plan: RenderPlan | None = None
+    render_tracks = tracks
+    overlays: list[OverlaySpec] = []
+    caption_clip_end = clip.end_seconds
+
     words = [
         captions_mod.Word(text=w.text, start=w.start, end=w.end)
         for w in transcript.words_in_range(clip.start_seconds, clip.end_seconds)
     ]
+
+    if has_effects:
+        # Recomputed fresh from the persisted effects/teaser on every render
+        # (including a Retry Render) - no Anthropic/ElevenLabs calls, pure
+        # deterministic geometry/timeline math. See app.pipeline.timeline.
+        augmented_keyframes = _augment_crop_keyframes_with_targets(clip, settings.effects_target_confidence_threshold)
+        plan = build_render_plan(clip, video_duration=media_info.duration_seconds, raw_crop_keyframes=augmented_keyframes)
+
+        # Narration audio keeps playing at its own natural pace once
+        # started - only its START needs remapping onto the new timeline
+        # (a freeze/slow_motion/replay/teaser changes what's on screen
+        # underneath, not the already-synthesized narration audio itself).
+        render_tracks = [
+            NarrationTrack(
+                audio_path=t.audio_path, start_seconds=plan.remap(cue.start_seconds), duration_seconds=t.duration_seconds
+            )
+            for cue, t in zip(clip.narration_cues, tracks, strict=False)
+        ]
+        overlays = _build_overlay_specs(clip, plan, media_info, clip_dir, settings.effects_target_confidence_threshold)
+
+        # Original-speech transcript captions must shift the same way -
+        # remap each word's position through the same timeline, then let
+        # build_ass_captions do its normal clip_start-relative subtraction
+        # by handing it synthetic "absolute" timestamps that resolve to the
+        # correct remapped value once it subtracts clip_start back out.
+        words = [
+            captions_mod.Word(
+                text=w.text,
+                start=clip.start_seconds + plan.remap(w.start - clip.start_seconds),
+                end=clip.start_seconds + plan.remap(w.end - clip.start_seconds),
+            )
+            for w in words
+        ]
+        caption_clip_end = clip.start_seconds + plan.expected_duration
+
+        clip.timeline_segments = [
+            TimelineSegmentRecord(
+                kind=seg.kind,
+                source_start=seg.source_start,
+                source_end=seg.source_end,
+                output_duration=seg.output_duration,
+                speed=seg.speed,
+            )
+            for seg in plan.segments
+        ]
+
     # clip.narration_cues and tracks are built/fetched in lockstep (same
     # order, same successfully-synthesized subset), so zipping them pairs
     # each cue's text/word timings with its actual audio placement in the
     # clip.
     narration_for_captions = [
         (track.start_seconds, track.start_seconds + track.duration_seconds, cue.text)
-        for cue, track in zip(clip.narration_cues, tracks, strict=False)
+        for cue, track in zip(clip.narration_cues, render_tracks, strict=False)
     ]
     narration_words = [
         captions_mod.Word(text=w.text, start=track.start_seconds + w.start, end=track.start_seconds + w.end)
-        for cue, track in zip(clip.narration_cues, tracks, strict=False)
+        for cue, track in zip(clip.narration_cues, render_tracks, strict=False)
         for w in cue.word_timings
     ]
     narration_words.sort(key=lambda w: w.start)
@@ -230,7 +414,7 @@ async def _render_and_upload_clip(
     captions_mod.build_ass_captions(
         output_path=ass_path,
         clip_start=clip.start_seconds,
-        clip_end=clip.end_seconds,
+        clip_end=caption_clip_end,
         transcript_words=words,
         narration_cues=narration_for_captions,
         narration_words=narration_words,
@@ -249,9 +433,11 @@ async def _render_and_upload_clip(
         end_seconds=clip.end_seconds,
         output_path=output_path,
         media_info=media_info,
-        narration_tracks=tracks,
+        narration_tracks=render_tracks,
         captions_ass_path=ass_path,
-        crop_keyframes=crop_keyframes,
+        crop_keyframes=crop_keyframes if plan is None else None,
+        segments=plan.segments if plan is not None else None,
+        overlays=overlays,
     )
 
     key = f"jobs/{job_id}/clips/{clip.id}.mp4"

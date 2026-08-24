@@ -8,10 +8,13 @@ A **private, single-user** tool that turns a road-rage/dashcam video into
 short vertical (1080x1920) TikTok-style highlight clips: it finds
 interesting moments using two-pass Claude vision analysis (sparse scan, then
 dense re-analysis of candidates), writes a short hook/setup/escalation/
-main-event/payoff narration for each, generates an English AI voice-over,
-burns in captions, and renders a blurred-background vertical composite. It
-is used two ways: a tiny mobile web page (`/upload`) and a remote MCP server
-(`/mcp`) so it can be driven from Claude on a phone.
+main-event/payoff narration for each, generates an energetic English AI
+voice-over, burns in word-by-word captions, smart-crops to a true full-screen
+9:16 composite that pans to follow the action, and can layer in TikTok-style
+visual-attention effects (red circle/arrow, punch-zoom, freeze-frame, slow
+motion, replay, cold-open teaser) around a specific visual target Claude
+localizes in frame. It is used two ways: a tiny mobile web page (`/upload`)
+and a remote MCP server (`/mcp`) so it can be driven from Claude on a phone.
 
 There are no accounts, subscriptions, or multi-tenant concerns - it's one
 person's tool, gated by a single shared password + MCP bearer token.
@@ -27,7 +30,7 @@ app/
   storage.py            R2 (boto3/S3-compatible) or local-disk storage, signed download URLs
   config.py              Settings (pydantic-settings, all via env vars)
   jobs/
-    models.py             Job/Clip/NarrationCue pydantic models
+    models.py             Job/Clip/NarrationCue/CropKeyframe/BBox/Target/Effect/Teaser/TimelineSegment models
     store.py               SQLite-backed job persistence
     service.py              Shared job-creation logic (used by both HTTP API and MCP)
     runner.py                In-process asyncio background job runner (no Redis/Celery)
@@ -36,11 +39,17 @@ app/
     download.py               SSRF-safe streaming video download
     ffmpeg_utils.py             probe/extract_audio/extract_frames wrappers around ffmpeg/ffprobe
     transcribe.py                 ElevenLabs Scribe speech-to-text (word timestamps)
-    vision.py                      Two-pass Claude vision analysis (tool-use structured output)
+    vision.py                      Two-pass Claude vision analysis (tool-use structured output),
+                                    now including crop_keyframes, effects, and an optional teaser
     scoring.py                      Turns analyses into a final non-overlapping clip selection
-    tts.py                           ElevenLabs text-to-speech narration
-    captions.py                      Builds .ass subtitle files (Hook/Narration/Caption styles)
-    render.py                         ffmpeg filter-graph: vertical blurred-bg composite + audio ducking/mix
+    tts.py                           ElevenLabs text-to-speech narration + per-word alignment
+    captions.py                      Builds .ass subtitle files (word-by-word Narration, Caption, Hook styles)
+    crop.py                          Smart pan-crop keyframe math (source -> 9:16 crop window over time)
+    geometry.py                      Source bbox -> crop window -> output-pixel transform, arrow placement
+    overlays.py                      Pillow-rendered transparent circle/arrow PNG overlays
+    timeline.py                      Effects/teaser -> concrete render segments + timestamp remap
+    render.py                         ffmpeg filter-graph: true full-screen smart crop, effect segments/
+                                       overlays, audio ducking/mix, duration validation
     pipeline.py                       Orchestrates all of the above end-to-end for one job
   templates/            upload.html (the whole mobile UI), login.html
 ```
@@ -57,14 +66,63 @@ app/
    each, summed to a 0-100 score), a hook line, and up to 5 narration cues (hook/setup/
    escalation/main_event/payoff, each optionally skipped so narration doesn't talk over
    everything).
-6. `scoring.select_clips` ranks by total score and greedily picks the best non-overlapping set,
-   clamping each clip into the 25-90s range (preferring 25-60s).
-7. Per selected clip: synthesize narration audio per cue (ElevenLabs TTS) and **upload it to
-   storage immediately** (see Resumability below), then build an .ass caption file (original
-   transcript captions everywhere narration *isn't* playing, narration captions where it is, a
-   hook title card at the very start), then render with `ffmpeg`: blurred/scaled vertical
-   composite + ducked-and-mixed audio + burned captions -> H.264/AAC MP4.
+6. `scoring.select_clips` filters out anything below a quality floor (`MIN_SELECTABLE_SCORE`),
+   ranks the rest by total score, and greedily picks the best non-overlapping set, clamping each
+   clip into a 6-90s hard range (no artificial minimum/preferred length - a clip runs exactly as
+   long as its story needs).
+7. Per selected clip: synthesize narration audio per cue (ElevenLabs TTS, with per-word
+   alignment) and **upload it to storage immediately** (see Resumability below), then build an
+   .ass caption file (original transcript captions everywhere narration *isn't* playing,
+   word-by-word narration captions where it is, a hook title card at the very start), then render
+   with `ffmpeg`: true full-screen 9:16 smart-crop composite (panning to follow the action, plus
+   any circle/arrow/punch-zoom/freeze/slow-motion/replay/teaser effects - see Effects below) +
+   ducked-and-mixed audio + burned captions -> H.264/AAC MP4.
 8. Upload each clip to storage; job records get a `expires_at` (default 48h) for retention cleanup.
+
+### Effects system (circle/arrow/punch-zoom/freeze/slow-motion/replay/teaser)
+
+Claude's pass-2 analysis (`vision.py`) can optionally flag up to a few `effects` per clip, each a
+type plus a clip-relative time window and (for circle/arrow/punch_zoom) a `target`: a description,
+a normalized bounding box in the *source* frame, and a confidence. A separate optional `teaser`
+names a short window from later in the same clip's own footage to play as a cold open. Both are
+persisted on the `Clip` (`app/jobs/models.py`) exactly as Claude returned them - no synthesis
+happens at analysis time, so a retry never needs to re-derive them.
+
+At render time (`pipeline._render_and_upload_clip`), everything is *recomputed fresh* from those
+persisted fields - this is deliberate: it's pure, deterministic geometry/timeline math, so
+recomputing costs nothing and a Retry Render is guaranteed to reproduce the same plan without
+touching Anthropic/ElevenLabs again:
+
+- `app/pipeline/timeline.py::build_render_plan` turns effects/teaser into an ordered list of
+  `SegmentPlan`s (normal / freeze / slow_motion / replay / zoom / teaser), each with its own
+  source range, output duration, speed, and (for zoom) a constant zoom factor - freeze/replay/
+  teaser add real output time, slow_motion stretches it, zoom/circle/arrow don't change duration
+  at all. It also gives a `remap(original_clip_relative_t)` function used to shift narration cue
+  starts, transcript-caption timestamps, and overlay windows onto the new timeline.
+- `render.py` only takes the segments-based path when there are effects (`segments is not None`)
+  - a clip with none renders through the exact same single crop+scale filter as before effects
+  existed, so the common case pays zero extra complexity. When segments are used, each becomes
+  its own `trim`/`setpts`(`/tpad` for freeze) + per-segment `crop_filter` (with that segment's own
+  constant `zoom`) chain, concatenated back together via ffmpeg's `concat` filter. Two things
+  learned the hard way (both covered by real-ffmpeg tests, not just assertions on the built
+  string): a filter-graph label consumed by more than one downstream filter needs an explicit
+  `split`/`asplit` fan-out first, and differently-sized crop windows across segments need
+  `setsar=1` on each or `concat` rejects them for mismatched SAR.
+- ffmpeg's `crop` filter only re-evaluates `x`/`y` per frame in the version this was built
+  against - `w`/`h` are fixed at filter init (confirmed empirically, not just from docs). That's
+  why punch-zoom is a *separate short segment* with a constant zoom, not a continuously animated
+  zoom within one crop call - see the module docstring in `crop.py` before trying to make zoom
+  vary smoothly inside a single `build_crop_filter` invocation.
+- `app/pipeline/geometry.py::transform_bbox_to_output` maps a source-frame bbox into
+  output-pixel space given whatever crop window is active at that instant (via
+  `crop.crop_window_at`, which must stay in lockstep with `build_crop_filter`'s own math) -
+  returns `None` if the target isn't usefully visible in that crop window, and callers must skip
+  drawing rather than guess. `pipeline._augment_crop_keyframes_with_targets` biases the base pan
+  toward a confident circle/arrow target around its effect window *before* the render plan is
+  built, so the crop is more likely to actually include it.
+- `app/pipeline/overlays.py` renders circle/arrow as a single static full-canvas (1080x1920)
+  transparent PNG per effect (not a per-frame sequence - stays cheap on a small Railway
+  container), composited with a plain `overlay=0:0:enable='between(t,start,end)'`.
 
 ### Resumability: retrying a failed job never repeats paid AI work
 
@@ -183,20 +241,25 @@ locally (apt-get ffmpeg install, pip install -r requirements.txt) - verify with 
   read back from ffmpeg - if you change the `-vf fps=...` filter to something more complex
   (e.g. `select=`), you'll need to compute real timestamps differently.
 - `scoring._clamp_duration` can shift a clip's start earlier than the original candidate (to hit
-  `MIN_CLIP_SECONDS`). `select_clips` compensates by shifting every `narration_cues[].start_seconds`
-  by the same amount (`head_shift`) before overwriting `a.start_seconds` - if you touch either
-  function, keep that shift in sync or narration will play at the wrong point in the rendered
-  clip. Tail truncation (clip too long) doesn't need compensation since
-  `pipeline._synthesize_and_store_narration` already clamps each cue's start into
+  `HARD_MIN_CLIP_SECONDS`). `select_clips` compensates by shifting every
+  `narration_cues[].start_seconds`, `crop_keyframes[].time_seconds`, and `effects[].start_seconds`/
+  `end_seconds` by the same amount (`head_shift`) before overwriting `a.start_seconds` - if you
+  touch that function or add another clip-relative field, keep that shift in sync or things will
+  play/appear at the wrong point in the rendered clip. `Teaser` is the one exception: it's in
+  *absolute* source-video seconds (not clip-relative), so it doesn't need shifting -
+  `app.pipeline.timeline` re-validates it still falls within the final clip bounds at render time
+  and disables it if not. Tail truncation (clip too long) doesn't need head-shift compensation
+  since `pipeline._synthesize_and_store_narration` already clamps each cue's start into
   `[0, clip.duration_seconds]` before it's ever persisted.
-- `render.py` deliberately caps ffmpeg/libx264 threading (`FFMPEG_THREADS`, default 2) and blurs
-  the background at a small internal resolution (`BG_BLUR_W`/`BG_BLUR_H`) before scaling back up
-  to 1080x1920 - small Railway containers report the *host's* full CPU count to ffmpeg, and an
-  unconstrained thread count plus a full-resolution `gblur` was enough to get the render process
-  OOM-killed (ffmpeg exits with return code -9). If you touch this file, keep the thread caps and
-  low-res blur; `ffmpeg_utils._describe_failure` gives OOM-killed renders (negative return code,
-  i.e. killed by signal) a distinct, clearly-labeled error message instead of a generic ffmpeg
-  failure - preserve that if you change error handling there.
+- `render.py` deliberately caps ffmpeg/libx264 threading (`FFMPEG_THREADS`, default 2). Small
+  Railway containers report the *host's* full CPU count to ffmpeg, and an unconstrained thread
+  count was enough to get the render process OOM-killed (ffmpeg exits with return code -9). If
+  you touch this file (including the effects-segment path), keep the thread caps everywhere they
+  appear (`-threads`, `-filter_threads`, `-filter_complex_threads`, x264 `threads=`); overlays are
+  small static PNGs and freeze uses `tpad` rather than a run of duplicate frames specifically to
+  avoid reintroducing memory pressure here. `ffmpeg_utils._describe_failure` gives OOM-killed
+  renders (negative return code, i.e. killed by signal) a distinct, clearly-labeled error message
+  instead of a generic ffmpeg failure - preserve that if you change error handling there.
 - `app/jobs/store.py::JobStore` uses an `asyncio.Lock` to serialize sqlite access. In production
   that's always used from a single event loop (one uvicorn process), so it's fine - but in tests,
   never seed/mutate job rows via `asyncio.run(get_job_store().save(...))` while a `TestClient` is

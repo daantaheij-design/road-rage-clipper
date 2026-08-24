@@ -40,6 +40,9 @@ class _Harness:
     def __init__(self, monkeypatch):
         self.calls = {"download": 0, "transcribe": 0, "scan": 0, "analyze": 0, "tts": 0, "render": 0}
         self.render_should_fail = True
+        self.effects_to_return: list = []
+        self.teaser_to_return = None
+        self.last_render_kwargs: dict = {}
 
         async def fake_download_video(url, dest, *, max_bytes, timeout_seconds):
             self.calls["download"] += 1
@@ -79,6 +82,8 @@ class _Harness:
                 narration_cues=[
                     vision.NarrationCueDraft(beat="hook", text="Watch this.", start_seconds=0.0, skip=False),
                 ],
+                effects=self.effects_to_return,
+                teaser=self.teaser_to_return,
             )
 
         async def fake_synthesize_narration(text, out_path):
@@ -103,9 +108,19 @@ class _Harness:
             narration_tracks=None,
             captions_ass_path=None,
             crop_keyframes=None,
+            segments=None,
+            overlays=None,
             threads=None,
         ):
             self.calls["render"] += 1
+            self.last_render_kwargs = {
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+                "narration_tracks": narration_tracks,
+                "crop_keyframes": crop_keyframes,
+                "segments": segments,
+                "overlays": overlays,
+            }
             if self.render_should_fail:
                 raise RuntimeError("simulated ffmpeg failure")
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -277,3 +292,95 @@ async def test_failure_before_ready_to_render_reuses_transcript_but_redoes_analy
     # ...but analysis WAS repeated, since it never completed successfully before.
     assert harness.calls["scan"] == 2
     assert harness.calls["analyze"] == 1
+
+
+async def test_clip_with_effects_persists_effects_and_uses_segments_render_path(settings, harness):
+    harness.render_should_fail = False
+    harness.effects_to_return = [
+        vision.EffectDraft(type="freeze", start_seconds=5.0, end_seconds=5.4),
+    ]
+    harness.teaser_to_return = vision.TeaserDraft(enabled=True, source_start=28.0, source_end=29.0)
+
+    job = Job(number_of_clips=1, source_url="https://example.com/video.mp4")
+    await get_job_store().save(job)
+    _place_fake_source(job.id)
+    await pipeline.process_job(job.id)
+
+    done = await get_job_store().get(job.id)
+    assert done.status == JobStatus.COMPLETED
+    clip = done.clips[0]
+    assert len(clip.effects) == 1
+    assert clip.effects[0].type == "freeze"
+    assert clip.teaser is not None and clip.teaser.enabled
+    # The derived render plan was persisted for debugging/inspectability.
+    assert clip.timeline_segments
+    assert any(s.kind == "freeze" for s in clip.timeline_segments)
+    assert any(s.kind == "teaser" for s in clip.timeline_segments)
+    # render_vertical_clip was actually called with the segments-based path.
+    assert harness.last_render_kwargs["segments"] is not None
+    assert harness.last_render_kwargs["crop_keyframes"] is None
+
+
+async def test_clip_without_effects_uses_legacy_render_path(settings, harness):
+    harness.render_should_fail = False
+    harness.effects_to_return = []
+    harness.teaser_to_return = None
+
+    job = Job(number_of_clips=1, source_url="https://example.com/video.mp4")
+    await get_job_store().save(job)
+    _place_fake_source(job.id)
+    await pipeline.process_job(job.id)
+
+    done = await get_job_store().get(job.id)
+    assert done.status == JobStatus.COMPLETED
+    assert done.clips[0].effects == []
+    assert done.clips[0].timeline_segments == []
+    # No effects/teaser -> the plain, pre-effects render path is used.
+    assert harness.last_render_kwargs["segments"] is None
+    assert harness.last_render_kwargs["crop_keyframes"] is not None
+
+
+async def test_retry_after_render_failure_with_effects_reuses_persisted_plan_and_makes_zero_new_ai_calls(
+    settings, harness
+):
+    harness.effects_to_return = [
+        vision.EffectDraft(
+            type="circle",
+            start_seconds=1.0,
+            end_seconds=2.0,
+            target=vision.TargetDraft(
+                description="white sedan", confidence=0.9, bbox=vision.BBoxDraft(x=0.5, y=0.4, width=0.2, height=0.2)
+            ),
+        ),
+    ]
+
+    job = Job(number_of_clips=1, source_url="https://example.com/video.mp4")
+    await get_job_store().save(job)
+
+    # First attempt: analysis succeeds, render fails.
+    _place_fake_source(job.id)
+    harness.render_should_fail = True
+    await pipeline.process_job(job.id)
+
+    failed = await get_job_store().get(job.id)
+    assert failed.status == JobStatus.FAILED
+    assert failed.ready_to_render is True
+    persisted_effects = failed.clips[0].effects
+    assert len(persisted_effects) == 1
+    assert persisted_effects[0].type == "circle"
+
+    # Retry: render succeeds this time, using the SAME persisted effect (no
+    # new Claude call re-derives it) and zero new Anthropic/ElevenLabs calls.
+    harness.render_should_fail = False
+    failed.status = JobStatus.QUEUED
+    await get_job_store().save(failed)
+    _place_fake_source(job.id)
+    await pipeline.process_job(job.id)
+
+    done = await get_job_store().get(job.id)
+    assert done.status == JobStatus.COMPLETED
+    assert done.clips[0].effects[0].type == "circle"
+    assert harness.calls == {"download": 0, "transcribe": 1, "scan": 1, "analyze": 1, "tts": 1, "render": 2}
+    assert harness.last_render_kwargs["segments"] is not None
+    assert harness.last_render_kwargs["overlays"] is not None
+    assert len(harness.last_render_kwargs["overlays"]) == 1  # the circle overlay PNG was (re)generated locally

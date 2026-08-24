@@ -90,6 +90,38 @@ class CropKeyframeDraft:
 
 
 @dataclass
+class BBoxDraft:
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+@dataclass
+class TargetDraft:
+    description: str
+    confidence: float
+    bbox: BBoxDraft | None = None
+
+
+@dataclass
+class EffectDraft:
+    type: str  # circle | arrow | punch_zoom | freeze | slow_motion | replay
+    start_seconds: float  # relative to the CLIP start (0 = clip start)
+    end_seconds: float
+    target: TargetDraft | None = None
+    zoom: float = 1.2
+    speed: float = 0.6
+
+
+@dataclass
+class TeaserDraft:
+    enabled: bool
+    source_start: float  # ABSOLUTE source-video seconds
+    source_end: float
+
+
+@dataclass
 class MomentAnalysis:
     is_moment: bool
     title: str
@@ -100,6 +132,8 @@ class MomentAnalysis:
     hook_text: str
     narration_cues: list[NarrationCueDraft]
     crop_keyframes: list[CropKeyframeDraft] = field(default_factory=list)
+    effects: list[EffectDraft] = field(default_factory=list)
+    teaser: TeaserDraft | None = None
 
     @property
     def total_score(self) -> int:
@@ -267,6 +301,94 @@ _ANALYZE_TOOL = {
                     "additionalProperties": False,
                 },
             },
+            "effects": {
+                "type": "array",
+                "description": (
+                    "0-3 visual-attention effects that genuinely improve this clip - do not add effects just "
+                    "because the feature exists; NONE is a completely valid answer for a clip that doesn't need "
+                    "any. All start_seconds/end_seconds are relative to the CLIP start (0 = clip start), matching "
+                    "narration_cues. Use CIRCLE or ARROW when the viewer might not immediately know which "
+                    "vehicle/object matters - typical on-screen duration 0.5-2.0s. Use PUNCH_ZOOM when a fast or "
+                    "small visual detail deserves emphasis - 0.4-1.5s, zoom 1.1-1.4x (set the zoom field). Use "
+                    "FREEZE when the viewer needs a beat to register a crucial frame (e.g. two vehicles inches "
+                    "apart) - 0.3-0.8s, never longer than ~1s, and don't freeze every incident. Use SLOW_MOTION "
+                    "when something important happens too fast to read clearly - only around the single most "
+                    "important instant, speed 0.5-0.75x (set the speed field), never make ordinary driving slow "
+                    "motion. Use REPLAY only when the key moment is genuinely easy to miss on first viewing - at "
+                    "most one replay per clip, 1-3 seconds, never a boring stretch of footage. CIRCLE, ARROW, and "
+                    "PUNCH_ZOOM should include a `target`: a short description plus a normalized bbox "
+                    "(x/y/width/height, 0-1, relative to the video frame you are looking at right now - same "
+                    "convention as crop_keyframes' focus_x/focus_y) and your confidence in that localization. If "
+                    "you are not confident which specific vehicle/object it is or exactly where it is in frame, "
+                    "either omit the bbox or give it low confidence (below ~0.75) rather than guessing - a wrong "
+                    "confident circle/arrow on the wrong car is worse than none; a PUNCH_ZOOM can still be used "
+                    "without a confident target (it just zooms toward the current point of interest)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["circle", "arrow", "punch_zoom", "freeze", "slow_motion", "replay"],
+                        },
+                        "start_seconds": {"type": "number"},
+                        "end_seconds": {"type": "number"},
+                        "target": {
+                            "type": "object",
+                            "description": "Optional - the specific vehicle/person/object this effect points at.",
+                            "properties": {
+                                "description": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "bbox": {
+                                    "type": "object",
+                                    "properties": {
+                                        "x": {"type": "number", "minimum": 0, "maximum": 1},
+                                        "y": {"type": "number", "minimum": 0, "maximum": 1},
+                                        "width": {"type": "number", "minimum": 0, "maximum": 1},
+                                        "height": {"type": "number", "minimum": 0, "maximum": 1},
+                                    },
+                                    "required": ["x", "y", "width", "height"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "required": ["description", "confidence"],
+                            "additionalProperties": False,
+                        },
+                        "zoom": {
+                            "type": "number",
+                            "minimum": 1.0,
+                            "maximum": 1.5,
+                            "description": "punch_zoom only: peak zoom factor, e.g. 1.25.",
+                        },
+                        "speed": {
+                            "type": "number",
+                            "minimum": 0.3,
+                            "maximum": 1.0,
+                            "description": "slow_motion/replay only: playback speed, e.g. 0.6.",
+                        },
+                    },
+                    "required": ["type", "start_seconds", "end_seconds"],
+                    "additionalProperties": False,
+                },
+            },
+            "teaser": {
+                "type": "object",
+                "description": (
+                    "Optional cold-open: a brief 0.5-2.5s glimpse of a LATER, more exciting moment from THIS "
+                    "SAME clip (source_start/source_end must fall within the start_seconds/end_seconds you chose "
+                    "above), shown before cutting back to the normal chronological setup. Use only when it "
+                    "genuinely makes a stronger opening than starting at the normal setup - most clips should "
+                    "leave this disabled. Never reveal the full payoff in the teaser, only enough to create "
+                    "curiosity."
+                ),
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "source_start": {"type": "number", "description": "Absolute source-video timestamp."},
+                    "source_end": {"type": "number", "description": "Absolute source-video timestamp."},
+                },
+                "required": ["enabled", "source_start", "source_end"],
+                "additionalProperties": False,
+            },
         },
         "required": [
             "is_moment",
@@ -278,6 +400,8 @@ _ANALYZE_TOOL = {
             "hook_text",
             "narration_cues",
             "crop_keyframes",
+            "effects",
+            "teaser",
         ],
         "additionalProperties": False,
     },
@@ -444,7 +568,15 @@ async def analyze_candidate(
         "seconds of lead-in for context is good, ten seconds of nothing happening is not. Still "
         "include a few seconds of lead-in before the incident itself rather than starting exactly on "
         "the action, and let it play out to a natural end (resolution or reaction) rather than cutting "
-        "off mid-beat."
+        "off mid-beat.\n\n"
+        "VISUAL EFFECTS: you may optionally flag up to 3 visual-attention effects (circle/arrow/"
+        "punch_zoom/freeze/slow_motion/replay) that would genuinely help a viewer understand or feel "
+        "this specific moment - most clips need 0-1, some need none at all. Do not add an effect just "
+        "because the feature exists; only add one where it clearly improves comprehension, tension, "
+        "curiosity, payoff, or retention. See the effects field description for what each type is for "
+        "and its typical timing. A circle/arrow needs a real target you can actually localize in frame "
+        "with a normalized bounding box - never guess at a box you aren't confident about; it is always "
+        "fine to leave effects empty."
     )
 
     content: list[dict] = [
@@ -499,6 +631,57 @@ async def analyze_candidate(
         except (KeyError, ValueError, TypeError):
             continue
 
+    effects: list[EffectDraft] = []
+    for e in result.get("effects", []):
+        try:
+            effect_type = str(e["type"])
+            if effect_type not in ("circle", "arrow", "punch_zoom", "freeze", "slow_motion", "replay"):
+                continue
+            target = None
+            raw_target = e.get("target")
+            if raw_target:
+                bbox = None
+                raw_bbox = raw_target.get("bbox")
+                if raw_bbox:
+                    try:
+                        bbox = BBoxDraft(
+                            x=float(raw_bbox["x"]),
+                            y=float(raw_bbox["y"]),
+                            width=float(raw_bbox["width"]),
+                            height=float(raw_bbox["height"]),
+                        )
+                    except (KeyError, ValueError, TypeError):
+                        bbox = None
+                target = TargetDraft(
+                    description=str(raw_target.get("description", "")),
+                    confidence=float(raw_target.get("confidence", 0.0)),
+                    bbox=bbox,
+                )
+            effects.append(
+                EffectDraft(
+                    type=effect_type,
+                    start_seconds=float(e["start_seconds"]),
+                    end_seconds=float(e["end_seconds"]),
+                    target=target,
+                    zoom=float(e.get("zoom", 1.2)),
+                    speed=float(e.get("speed", 0.6)),
+                )
+            )
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    teaser: TeaserDraft | None = None
+    raw_teaser = result.get("teaser")
+    if raw_teaser and raw_teaser.get("enabled"):
+        try:
+            teaser = TeaserDraft(
+                enabled=True,
+                source_start=float(raw_teaser["source_start"]),
+                source_end=float(raw_teaser["source_end"]),
+            )
+        except (KeyError, ValueError, TypeError):
+            teaser = None
+
     try:
         start_seconds = float(result["start_seconds"])
         end_seconds = float(result["end_seconds"])
@@ -515,4 +698,6 @@ async def analyze_candidate(
         hook_text=str(result.get("hook_text", "")),
         narration_cues=cues,
         crop_keyframes=crop_keyframes,
+        effects=effects,
+        teaser=teaser,
     )

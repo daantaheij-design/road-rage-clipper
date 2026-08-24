@@ -81,15 +81,21 @@ def select_clips(
 
         # Narration cue timing is relative to the clip start Claude saw when
         # it proposed this window - if clamping pulled the head earlier to
-        # hit the minimum duration, shift cues (and crop keyframes, which use
-        # the same clip-relative convention) by the same amount so they stay
-        # aligned with the actual rendered clip start.
+        # hit the minimum duration, shift cues (and crop keyframes/effects,
+        # which use the same clip-relative convention) by the same amount so
+        # they stay aligned with the actual rendered clip start. Teaser uses
+        # ABSOLUTE source-video seconds instead, so it doesn't need shifting -
+        # app.pipeline.timeline validates it still falls within the final
+        # [start, end] bounds at render time and disables it if not.
         head_shift = a.start_seconds - start
         if head_shift:
             for cue in a.narration_cues:
                 cue.start_seconds += head_shift
             for kf in a.crop_keyframes:
                 kf.time_seconds += head_shift
+            for effect in a.effects:
+                effect.start_seconds += head_shift
+                effect.end_seconds += head_shift
 
         a.start_seconds, a.end_seconds = start, end
 

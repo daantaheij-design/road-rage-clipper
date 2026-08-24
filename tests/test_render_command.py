@@ -247,6 +247,141 @@ async def test_render_raises_when_actual_duration_does_not_match_requested(setti
         )
 
 
+async def test_render_with_no_effects_never_touches_segment_machinery(settings, captured_args, tmp_path):
+    """segments=None (the default, and what pipeline.py passes for a clip
+    with no effects/teaser) must produce the exact same filter graph shape
+    as before effects existed - no split/asplit/concat overhead."""
+    await render_vertical_clip(
+        source_path=tmp_path / "in.mp4",
+        start_seconds=0.0,
+        end_seconds=10.0,
+        output_path=tmp_path / "out.mp4",
+        media_info=MEDIA_INFO,
+    )
+    filter_complex = _flag_value(captured_args["args"], "-filter_complex")
+    assert "split=" not in filter_complex
+    assert "concat=" not in filter_complex
+
+
+async def test_segments_path_produces_split_and_concat(settings, captured_args, tmp_path):
+    from app.pipeline.crop import CropKeyframe
+    from app.pipeline.timeline import SegmentPlan
+
+    segments = [
+        SegmentPlan("normal", 0.0, 5.0, 5.0, crop_keyframes=[CropKeyframe(0, 0.5, 0.5, 0.9)]),
+        SegmentPlan("freeze", 5.0, 5.0, 0.5, volume=0.0, crop_keyframes=[CropKeyframe(0, 0.5, 0.5, 0.5)]),
+        SegmentPlan("normal", 5.0, 10.0, 5.0, crop_keyframes=[CropKeyframe(0, 0.5, 0.5, 0.9)]),
+    ]
+    await render_vertical_clip(
+        source_path=tmp_path / "in.mp4",
+        start_seconds=0.0,
+        end_seconds=10.0,
+        output_path=tmp_path / "out.mp4",
+        media_info=MEDIA_INFO,
+        segments=segments,
+    )
+    filter_complex = _flag_value(captured_args["args"], "-filter_complex")
+    assert "split=3" in filter_complex
+    assert "concat=n=3:v=1:a=1" in filter_complex
+    assert "tpad=stop_mode=clone" in filter_complex  # the freeze segment
+    assert "aevalsrc=" in filter_complex  # silent audio for the freeze
+
+
+async def test_segments_path_output_duration_cap_uses_expected_duration_not_raw_window(
+    settings, captured_args, tmp_path
+):
+    """A freeze adds real output time beyond end_seconds-start_seconds - the
+    output-side -t cap (and duration validation) must use the sum of
+    segment output durations, not the raw clip window, or a legitimately
+    longer render would get truncated/rejected."""
+    from app.pipeline.crop import CropKeyframe
+    from app.pipeline.timeline import SegmentPlan
+
+    segments = [
+        SegmentPlan("normal", 0.0, 10.0, 10.0, crop_keyframes=[CropKeyframe(0, 0.5, 0.5, 0.9)]),
+        SegmentPlan("freeze", 10.0, 10.0, 0.5, volume=0.0, crop_keyframes=[CropKeyframe(0, 0.5, 0.5, 0.5)]),
+    ]
+    await render_vertical_clip(
+        source_path=tmp_path / "in.mp4",
+        start_seconds=0.0,
+        end_seconds=10.0,
+        output_path=tmp_path / "out.mp4",
+        media_info=MEDIA_INFO,
+        segments=segments,
+    )
+    args = captured_args["args"]
+    assert args[-3] == "-t"
+    assert args[-2] == "10.500"  # 10.0 + 0.5 freeze, not the raw 10.0 window
+
+
+async def test_overlay_input_added_and_referenced_with_enable_window(settings, captured_args, tmp_path):
+    from app.pipeline.render import OverlaySpec
+
+    overlay_png = tmp_path / "circle.png"
+    overlay_png.write_bytes(b"fake png")
+
+    await render_vertical_clip(
+        source_path=tmp_path / "in.mp4",
+        start_seconds=0.0,
+        end_seconds=10.0,
+        output_path=tmp_path / "out.mp4",
+        media_info=MEDIA_INFO,
+        overlays=[OverlaySpec(image_path=overlay_png, start_seconds=1.5, end_seconds=3.0)],
+    )
+    args = captured_args["args"]
+    filter_complex = _flag_value(args, "-filter_complex")
+    assert str(overlay_png) in args
+    assert "overlay=0:0:enable='between(t,1.500,3.000)'" in filter_complex
+
+
+async def test_multiple_overlays_each_get_their_own_input_and_chain(settings, captured_args, tmp_path):
+    from app.pipeline.render import OverlaySpec
+
+    png1, png2 = tmp_path / "a.png", tmp_path / "b.png"
+    png1.write_bytes(b"a")
+    png2.write_bytes(b"b")
+
+    await render_vertical_clip(
+        source_path=tmp_path / "in.mp4",
+        start_seconds=0.0,
+        end_seconds=10.0,
+        output_path=tmp_path / "out.mp4",
+        media_info=MEDIA_INFO,
+        overlays=[
+            OverlaySpec(image_path=png1, start_seconds=1.0, end_seconds=2.0),
+            OverlaySpec(image_path=png2, start_seconds=4.0, end_seconds=5.0),
+        ],
+    )
+    args = captured_args["args"]
+    filter_complex = _flag_value(args, "-filter_complex")
+    assert str(png1) in args
+    assert str(png2) in args
+    assert filter_complex.count("overlay=0:0:enable=") == 2
+
+
+async def test_setsar_forces_square_pixels_in_segments_path(settings, captured_args, tmp_path):
+    """Regression: without setsar=1, differently-sized crop windows across
+    segments (e.g. a punch-zoom segment vs. a normal one) can produce
+    mismatched SAR and concat refuses to join them."""
+    from app.pipeline.crop import CropKeyframe
+    from app.pipeline.timeline import SegmentPlan
+
+    segments = [
+        SegmentPlan("normal", 0.0, 5.0, 5.0, crop_keyframes=[CropKeyframe(0, 0.5, 0.5, 0.9)]),
+        SegmentPlan("zoom", 5.0, 6.0, 1.0, zoom=1.3, crop_keyframes=[CropKeyframe(0, 0.5, 0.5, 0.9)]),
+    ]
+    await render_vertical_clip(
+        source_path=tmp_path / "in.mp4",
+        start_seconds=0.0,
+        end_seconds=6.0,
+        output_path=tmp_path / "out.mp4",
+        media_info=MEDIA_INFO,
+        segments=segments,
+    )
+    filter_complex = _flag_value(captured_args["args"], "-filter_complex")
+    assert filter_complex.count("setsar=1") == 2
+
+
 async def test_render_accepts_small_duration_drift(settings, monkeypatch, tmp_path):
     async def fake_run_ffmpeg(args, *, timeout=900):
         return ""

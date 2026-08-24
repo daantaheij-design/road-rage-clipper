@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     elevenlabs_voice_style: float = 0.55
     elevenlabs_voice_speed: float = 1.05
 
+    # Below this confidence, a visual-attention effect's target localization
+    # isn't trusted enough to draw a circle/arrow pointing at it (a wrong
+    # confident guess - an arrow on the wrong car - is worse than no
+    # annotation at all). See app/pipeline/geometry.py.
+    effects_target_confidence_threshold: float = 0.75
+
     # Storage
     r2_account_id: str = ""
     r2_access_key_id: str = ""

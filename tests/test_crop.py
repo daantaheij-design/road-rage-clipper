@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from app.pipeline.crop import (
     MAX_PAN_SPEED_PER_SECOND,
     MIN_TRUSTED_CONFIDENCE,
     CropKeyframe,
     build_crop_filter,
+    crop_window_at,
+    interpolate_focus,
     prepare_keyframes,
+    slice_keyframes_local,
 )
 
 
@@ -170,3 +175,94 @@ def test_build_crop_filter_zero_duration_does_not_crash():
         target_height=1920,
     )
     assert "crop=" in filt
+
+
+def test_build_crop_filter_zoom_shrinks_crop_window():
+    kwargs = dict(
+        keyframes=[CropKeyframe(0.0, 0.5, 0.5, 0.9)],
+        clip_duration=5.0,
+        source_width=1920,
+        source_height=1080,
+        target_width=1080,
+        target_height=1920,
+    )
+    unzoomed = build_crop_filter(**kwargs)
+    zoomed = build_crop_filter(**kwargs, zoom=1.3)
+    w_unzoomed = int(re.search(r"w=(\d+)", unzoomed).group(1))
+    w_zoomed = int(re.search(r"w=(\d+)", zoomed).group(1))
+    assert w_zoomed < w_unzoomed
+    assert abs(w_zoomed - w_unzoomed / 1.3) <= 2
+
+
+def test_build_crop_filter_zoom_below_1_is_clamped_to_1():
+    kwargs = dict(
+        keyframes=[CropKeyframe(0.0, 0.5, 0.5, 0.9)],
+        clip_duration=5.0,
+        source_width=1920,
+        source_height=1080,
+        target_width=1080,
+        target_height=1920,
+    )
+    normal = build_crop_filter(**kwargs)
+    shrunk_request = build_crop_filter(**kwargs, zoom=0.5)  # zoom < 1 makes no sense - must not widen the crop
+    assert normal == shrunk_request
+
+
+def test_interpolate_focus_linear_between_two_points():
+    prepared = [CropKeyframe(0.0, 0.0, 0.5, 0.9), CropKeyframe(10.0, 1.0, 0.5, 0.9)]
+    fx, fy, _ = interpolate_focus(prepared, 5.0)
+    assert fx == pytest.approx(0.5)
+
+
+def test_interpolate_focus_clamps_outside_range():
+    prepared = [CropKeyframe(2.0, 0.2, 0.5, 0.9), CropKeyframe(8.0, 0.8, 0.5, 0.9)]
+    fx_before, _, _ = interpolate_focus(prepared, -5.0)
+    fx_after, _, _ = interpolate_focus(prepared, 100.0)
+    assert fx_before == pytest.approx(0.2)
+    assert fx_after == pytest.approx(0.8)
+
+
+def test_interpolate_focus_empty_returns_center():
+    fx, fy, conf = interpolate_focus([], 3.0)
+    assert fx == 0.5
+    assert fy == 0.5
+    assert conf == 0.0
+
+
+def test_slice_keyframes_local_rebases_to_zero():
+    prepared = prepare_keyframes(
+        [CropKeyframe(0.0, 0.2, 0.5, 0.9), CropKeyframe(10.0, 0.8, 0.5, 0.9)], clip_duration=10.0
+    )
+    sliced = slice_keyframes_local(prepared, 3.0, 6.0)
+    assert sliced[0].time_seconds == pytest.approx(0.0)
+    assert sliced[-1].time_seconds == pytest.approx(3.0)
+
+
+def test_slice_keyframes_local_applies_time_scale_for_slow_motion():
+    prepared = prepare_keyframes([CropKeyframe(0.0, 0.5, 0.5, 0.9)], clip_duration=10.0)
+    sliced = slice_keyframes_local(prepared, 2.0, 4.0, time_scale=2.0)  # 0.5x speed -> 2x local duration
+    assert sliced[-1].time_seconds == pytest.approx(4.0)  # (4-2)*2
+
+
+def test_crop_window_at_matches_build_crop_filter_dimensions():
+    keyframes = [CropKeyframe(0.0, 0.5, 0.5, 0.9)]
+    x, y, w, h = crop_window_at(
+        keyframes, 0.0, clip_duration=5.0, source_width=1920, source_height=1080, target_width=1080, target_height=1920
+    )
+    filt = build_crop_filter(keyframes, clip_duration=5.0, source_width=1920, source_height=1080, target_width=1080, target_height=1920)
+    w_expected = int(re.search(r"w=(\d+)", filt).group(1))
+    h_expected = int(re.search(r"h=(\d+)", filt).group(1))
+    assert w == pytest.approx(w_expected, abs=1)
+    assert h == pytest.approx(h_expected, abs=1)
+
+
+def test_crop_window_at_shrinks_with_zoom():
+    keyframes = [CropKeyframe(0.0, 0.5, 0.5, 0.9)]
+    x0, y0, w0, h0 = crop_window_at(
+        keyframes, 0.0, clip_duration=5.0, source_width=1920, source_height=1080, target_width=1080, target_height=1920
+    )
+    x1, y1, w1, h1 = crop_window_at(
+        keyframes, 0.0, clip_duration=5.0, source_width=1920, source_height=1080, target_width=1080, target_height=1920, zoom=1.5
+    )
+    assert w1 < w0
+    assert h1 < h0
