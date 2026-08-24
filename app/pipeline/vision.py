@@ -134,6 +134,15 @@ class MomentAnalysis:
     crop_keyframes: list[CropKeyframeDraft] = field(default_factory=list)
     effects: list[EffectDraft] = field(default_factory=list)
     teaser: TeaserDraft | None = None
+    # Claude's own reasoning about the incident's shape (see
+    # incident_boundaries in _ANALYZE_TOOL) - kept mainly so
+    # analyze_candidate can enforce "don't cut away from a continuous
+    # collision+confrontation" even if start_seconds/end_seconds
+    # second-guess it, and so tests can assert on it directly.
+    is_continuous_single_event: bool = False
+    incident_start: float | None = None
+    payoff_end: float | None = None
+    incident_end: float | None = None
 
     @property
     def total_score(self) -> int:
@@ -195,16 +204,63 @@ _ANALYZE_TOOL = {
                 "type": "string",
                 "description": "2-4 sentences describing what visibly happens, in order. Observable facts only.",
             },
+            "incident_boundaries": {
+                "type": "object",
+                "description": (
+                    "Work through the FULL shape of this incident before choosing start_seconds/end_seconds "
+                    "below - do this even for a simple, single-beat moment (in that case several of these "
+                    "will land close together or equal incident_peak). All absolute video timestamps. "
+                    "pre_context_start: where a viewer would need to start watching to understand the setup. "
+                    "incident_start: where the main event/incident itself begins (e.g. the cut-off begins, the "
+                    "vehicles first make contact). incident_peak: the single most dramatic instant (e.g. the "
+                    "moment of collision/impact). escalation_start: if a confrontation, argument, or exiting "
+                    "the vehicle follows, where THAT begins - equal to incident_peak if nothing follows. "
+                    "payoff_end: where the story reaches a natural resolution (the argument ends, someone "
+                    "drives off, the reaction settles) - this is NOT the same as incident_peak when something "
+                    "meaningful happens after the peak. incident_end: a few seconds after payoff_end, a clean "
+                    "cut point. is_continuous_single_event: true if a collision/incident and any subsequent "
+                    "argument/confrontation are ONE continuous, temporally-linked event (the driver getting "
+                    "out and confronting the other driver right after a collision is ONE event, not two) - "
+                    "false only if there are genuinely two separate, unrelated moments."
+                ),
+                "properties": {
+                    "pre_context_start": {"type": "number"},
+                    "incident_start": {"type": "number"},
+                    "incident_peak": {"type": "number"},
+                    "escalation_start": {"type": "number"},
+                    "payoff_end": {"type": "number"},
+                    "incident_end": {"type": "number"},
+                    "is_continuous_single_event": {"type": "boolean"},
+                },
+                "required": [
+                    "pre_context_start",
+                    "incident_start",
+                    "incident_peak",
+                    "escalation_start",
+                    "payoff_end",
+                    "incident_end",
+                    "is_continuous_single_event",
+                ],
+                "additionalProperties": False,
+            },
             "start_seconds": {
                 "type": "number",
                 "description": (
-                    "Absolute video timestamp where the CLIP should start - include a few seconds of lead-in "
-                    "before the incident so the viewer understands the setup, not just the exact incident frame."
+                    "Absolute video timestamp where the CLIP should start - normally equal to "
+                    "incident_boundaries.pre_context_start (a few seconds of lead-in so the viewer understands "
+                    "the setup, not just the exact incident frame)."
                 ),
             },
             "end_seconds": {
                 "type": "number",
-                "description": "Absolute video timestamp where the clip should end, after a natural payoff/resolution.",
+                "description": (
+                    "Absolute video timestamp where the clip should end. When is_continuous_single_event is "
+                    "true, this MUST cover through incident_boundaries.payoff_end (or incident_end) - do NOT "
+                    "cut away right after incident_peak if a linked confrontation/argument/reaction follows; "
+                    "the clip must preserve the complete story, not just the single most dramatic frame. "
+                    "Only stop earlier than incident_end if what follows is genuinely dead time with nothing "
+                    "relevant happening."
+                ),
             },
             "scores": {
                 "type": "object",
@@ -394,6 +450,7 @@ _ANALYZE_TOOL = {
             "is_moment",
             "title",
             "explanation",
+            "incident_boundaries",
             "start_seconds",
             "end_seconds",
             "scores",
@@ -421,6 +478,13 @@ async def _call_tool(client: anthropic.AsyncAnthropic, *, system: str, content: 
         if block.type == "tool_use":
             return block.input
     raise RuntimeError(f"Claude did not return a tool_use block for {tool['name']}")
+
+
+def _safe_float(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _batches(frames: list[Frame], size: int, overlap: int) -> list[list[Frame]]:
@@ -561,14 +625,19 @@ async def analyze_candidate(
         "quality: if this moment is genuinely weak (ordinary traffic, no real action, nothing "
         "surprising), set is_moment to false rather than inflating scores to justify a mediocre clip - "
         "a private individual would rather get one excellent clip than several forgettable ones.\n\n"
-        "CLIP LENGTH: choose the SHORTEST duration that still delivers a setup, the event/escalation, "
-        "and a payoff - do not stretch a short incident to hit a target length. Preferred range is "
-        "roughly 8-45 seconds; go longer (up to ~90s) only when the story genuinely needs it, and "
-        "shorter (down to ~6s) is fine for a single sharp moment. Cut dead time aggressively - a few "
-        "seconds of lead-in for context is good, ten seconds of nothing happening is not. Still "
-        "include a few seconds of lead-in before the incident itself rather than starting exactly on "
-        "the action, and let it play out to a natural end (resolution or reaction) rather than cutting "
-        "off mid-beat.\n\n"
+        "CLIP LENGTH: the goal is the SHORTEST duration that still tells a COMPLETE, satisfying story - "
+        "that is a very different thing from the shortest duration, period. Removing the payoff or the "
+        "context is not 'shorter', it's broken. Only cut a genuinely boring/dead stretch where nothing "
+        "relevant is happening - never cut away from a continuous, temporally-linked event just to hit "
+        "a shorter number. A collision immediately followed by the driver getting out and confronting "
+        "the other driver is ONE event: the clip must include the confrontation, not stop at the "
+        "collision frame. Work out incident_boundaries first (see that field) and use it: start_seconds "
+        "should land at pre_context_start, and when is_continuous_single_event is true, end_seconds must "
+        "reach payoff_end/incident_end, not stop at incident_peak. Preferred range is roughly 8-45 "
+        "seconds; go longer (up to ~90s) whenever the real story needs it - a 25-second clip that "
+        "actually finishes its story beats a confusing 5-second fragment every time. Shorter (down to "
+        "~6s) is only correct when the entire meaningful event genuinely lasts about that long, not as "
+        "a general target to aim for.\n\n"
         "VISUAL EFFECTS: you may optionally flag up to 3 visual-attention effects (circle/arrow/"
         "punch_zoom/freeze/slow_motion/replay) that would genuinely help a viewer understand or feel "
         "this specific moment - most clips need 0-1, some need none at all. Do not add an effect just "
@@ -688,6 +757,25 @@ async def analyze_candidate(
     except (KeyError, ValueError, TypeError):
         return None
 
+    boundaries = result.get("incident_boundaries") or {}
+    is_continuous = bool(boundaries.get("is_continuous_single_event", False))
+    incident_start = _safe_float(boundaries.get("incident_start"))
+    payoff_end = _safe_float(boundaries.get("payoff_end"))
+    incident_end = _safe_float(boundaries.get("incident_end"))
+    pre_context_start = _safe_float(boundaries.get("pre_context_start"))
+
+    # Safety net: Claude's own stated incident shape takes precedence over
+    # start_seconds/end_seconds if they contradict it - this is what stops
+    # a continuous collision+confrontation from silently collapsing down to
+    # just the collision frame even if the final fields second-guess the
+    # boundaries reasoning. Widening only, never narrows a candidate.
+    if is_continuous:
+        target_end = payoff_end if payoff_end is not None else incident_end
+        if target_end is not None and target_end > end_seconds:
+            end_seconds = target_end
+        if pre_context_start is not None and pre_context_start < start_seconds:
+            start_seconds = pre_context_start
+
     return MomentAnalysis(
         is_moment=True,
         title=str(result.get("title", "Road rage moment")),
@@ -700,4 +788,8 @@ async def analyze_candidate(
         crop_keyframes=crop_keyframes,
         effects=effects,
         teaser=teaser,
+        is_continuous_single_event=is_continuous,
+        incident_start=incident_start,
+        payoff_end=payoff_end,
+        incident_end=incident_end,
     )

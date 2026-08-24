@@ -276,3 +276,55 @@ def test_crop_keyframes_used_instead_of_clip_field_when_raw_override_given():
     override = [CropKeyframe(0.0, 0.9, 0.1, 0.9)]
     plan = build_render_plan(clip, video_duration=600.0, raw_crop_keyframes=override)
     assert any(abs(kf.focus_x - 0.9) < 1e-6 for kf in plan.segments[0].crop_keyframes)
+
+
+def test_teaser_never_replaces_or_truncates_the_main_incident_timeline():
+    """A cold-open teaser is ONLY a brief opening preview - it must never
+    become (or shrink) the actual incident timeline. Regression for a
+    reported concern that a teaser/effect segment could accidentally
+    replace or truncate the main story."""
+    clip = _clip(start=0.0, end=40.0)  # a 40s "full incident" clip
+    clip.teaser = Teaser(enabled=True, source_start=35.0, source_end=36.5)
+    plan = build_render_plan(clip, video_duration=600.0)
+
+    # Teaser is a small, separate, PREPENDED segment - never the whole plan.
+    assert plan.segments[0].kind == "teaser"
+    assert plan.segments[0].output_duration <= 3.0  # bounded, never "the whole video"
+    assert len(plan.segments) > 1
+
+    # Every second of the main incident is still represented in the
+    # timeline (as normal/zoom/slow_motion segments) - the teaser is
+    # strictly additive, it doesn't consume or remove any of it.
+    main_segments = [s for s in plan.segments if s.kind != "teaser"]
+    total_main_source_coverage = sum(s.source_end - s.source_start for s in main_segments if s.kind != "freeze")
+    assert total_main_source_coverage == pytest.approx(40.0)
+
+    # The full 40s incident duration is still present in the final output -
+    # a teaser only ADDS time at the front, it never reduces the total.
+    assert plan.expected_duration >= 40.0
+    assert plan.expected_duration == pytest.approx(40.0 + plan.segments[0].output_duration)
+
+
+def test_teaser_plus_effects_still_preserve_full_incident_span():
+    """Combine a teaser with freeze/slow_motion/replay effects (the exact
+    kind of "production" clip this was reported against) and confirm the
+    full incident is still covered, not collapsed down to a fragment."""
+    clip = _clip(start=0.0, end=40.0)
+    clip.teaser = Teaser(enabled=True, source_start=32.0, source_end=33.0)
+    clip.effects = [
+        Effect(type="freeze", start_seconds=12.0, end_seconds=12.5),
+        Effect(type="slow_motion", start_seconds=20.0, end_seconds=21.0, speed=0.5),
+        Effect(type="replay", start_seconds=25.0, end_seconds=26.0, speed=1.0),
+    ]
+    plan = build_render_plan(clip, video_duration=600.0)
+
+    # The rendered output must be AT LEAST as long as the full incident
+    # (40s) plus the teaser - freeze/slow_motion/replay only ever add time,
+    # never remove any of the original 40s of footage.
+    assert plan.expected_duration >= 40.0 + plan.segments[0].output_duration
+
+    # remap() at the very end of the original clip must land near the end
+    # of the final render, not somewhere truncated mid-way through.
+    end_of_incident_in_final_timeline = plan.remap(39.9)
+    assert end_of_incident_in_final_timeline >= 39.9  # never earlier than the original position
+    assert end_of_incident_in_final_timeline <= plan.expected_duration + 1e-6

@@ -328,3 +328,151 @@ async def test_effects_visibly_render_circle_punch_zoom_and_freeze(tmp_path, has
     # --- and a frame just after the freeze differs again (playback resumed) ---
     after_freeze = _extract_frame(5.0, "f_after_freeze.png")
     assert _mean_abs_diff(after_freeze, freeze_a) > 5.0
+
+
+async def test_narrator_captions_render_literally_one_word_at_a_time(tmp_path, has_ffmpeg):
+    """Spec requirement: narrator captions must show exactly ONE spoken
+    word on screen at a time, never a multi-word chunk or full sentence.
+    Renders the SAME narration ("THIS DRIVER GOT WAY TOO CLOSE") two ways -
+    the real word-by-word path, and the old whole-cue fallback path used
+    when no per-word alignment is available - onto a plain dark background,
+    then decodes actual frames and measures how wide the rendered caption
+    text is in each. A single word must render narrower than the full
+    six-word sentence by a wide margin; this is a self-calibrating check
+    (no hardcoded pixel-width guess) that doesn't require OCR."""
+    if not has_ffmpeg:
+        pytest.skip("ffmpeg not available")
+
+    from PIL import Image
+
+    from app.pipeline.captions import Word, build_ass_captions
+    from app.pipeline.ffmpeg_utils import probe
+
+    words_text = ["THIS", "DRIVER", "GOT", "WAY", "TOO", "CLOSE"]
+    words = []
+    t = 0.5
+    for w in words_text:
+        dur = 0.05 * len(w) + 0.35
+        words.append(Word(text=w, start=t, end=t + dur))
+        t += dur + 0.05
+    cue_end = t
+
+    background = tmp_path / "bg.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:size=1920x1080:rate=30:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(background),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    media_info = await ffmpeg_utils.probe(background)
+
+    word_ass = tmp_path / "word_by_word.ass"
+    build_ass_captions(
+        output_path=word_ass,
+        clip_start=0.0,
+        clip_end=6.0,
+        transcript_words=[],
+        narration_cues=[(0.5, cue_end, " ".join(words_text))],
+        narration_words=words,
+        hook_text=None,
+    )
+    sentence_ass = tmp_path / "whole_sentence.ass"
+    build_ass_captions(
+        output_path=sentence_ass,
+        clip_start=0.0,
+        clip_end=6.0,
+        transcript_words=[],
+        narration_cues=[(0.5, cue_end, " ".join(words_text))],
+        narration_words=None,  # forces the old whole-cue fallback path
+        hook_text=None,
+    )
+
+    word_out = tmp_path / "word_by_word.mp4"
+    await render_vertical_clip(
+        source_path=background, start_seconds=0.0, end_seconds=6.0, output_path=word_out,
+        media_info=media_info, captions_ass_path=word_ass,
+    )
+    sentence_out = tmp_path / "whole_sentence.mp4"
+    await render_vertical_clip(
+        source_path=background, start_seconds=0.0, end_seconds=6.0, output_path=sentence_out,
+        media_info=media_info, captions_ass_path=sentence_ass,
+    )
+
+    for out in (word_out, sentence_out):
+        info = await probe(out)
+        assert info.width == 1080
+        assert info.height == 1920
+
+    def _text_bbox_width(img: Image.Image) -> int:
+        # Caption band: Narration style sits ~65% down (MarginV=660,
+        # Alignment=2/bottom-anchored) - scan a generous band around it for
+        # bright (white/yellow glyph) pixels against the black background.
+        xs = []
+        for y in range(1080, 1360, 2):
+            for x in range(0, 1080, 2):
+                r, g, b = img.getpixel((x, y))
+                if r > 150 and g > 150:  # white or yellow glyph fill, not the near-black outline
+                    xs.append(x)
+        return (max(xs) - min(xs)) if xs else 0
+
+    def _extract_frame(path, t: float, name: str) -> Image.Image:
+        frame_path = tmp_path / name
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(path), "-frames:v", "1", str(frame_path)],
+            check=True,
+            capture_output=True,
+        )
+        return Image.open(frame_path).convert("RGB")
+
+    # The whole-sentence render's text width (all 6 words together) is the
+    # calibration ceiling - a single word must be clearly narrower than this.
+    sentence_frame = _extract_frame(sentence_out, 1.5, "f_sentence.png")
+    sentence_width = _text_bbox_width(sentence_frame)
+    assert sentence_width > 0, "expected the whole-sentence fallback to render visible text"
+
+    word_widths = []
+    for w in words:
+        mid = (w.start + w.end) / 2
+        frame = _extract_frame(word_out, mid, f"f_word_{w.text}.png")
+        width = _text_bbox_width(frame)
+        assert width > 0, f"expected visible text for word {w.text!r} at t={mid:.2f}"
+        word_widths.append(width)
+
+    for width, w in zip(word_widths, words, strict=True):
+        assert width < sentence_width * 0.6, (
+            f"word {w.text!r} rendered {width}px wide - too close to the full-sentence width "
+            f"({sentence_width}px), suggesting more than one word is visible at once"
+        )
+
+    # Two DIFFERENT words must not be visible in the same frame: sample
+    # right at a word boundary and confirm the previous word has actually
+    # disappeared (its glyph shape is gone, not just faded) by the time the
+    # next one starts - i.e. no simultaneous two-word rendering anywhere.
+    for i in range(len(words) - 1):
+        boundary = words[i + 1].start + 0.01
+        frame = _extract_frame(word_out, boundary, f"f_boundary_{i}.png")
+        width = _text_bbox_width(frame)
+        assert width < sentence_width * 0.6, (
+            f"at the boundary between {words[i].text!r} and {words[i + 1].text!r}, rendered width "
+            f"{width}px suggests both words are visible simultaneously"
+        )

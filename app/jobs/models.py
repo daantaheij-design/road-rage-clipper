@@ -217,6 +217,17 @@ class Job(BaseModel):
     ready_to_render: bool = False
     transcript_words: list[TranscriptWordRecord] = Field(default_factory=list)
 
+    # Which generation of the clip-selection/story-planning logic
+    # (app.pipeline.pipeline.ANALYSIS_VERSION) produced this job's clips -
+    # stamped once ready_to_render is set. 0 means "predates versioning"
+    # (a job analyzed before this field existed). Purely informational: it
+    # lets a human/UI recognize that an old job's cached plan came from
+    # different selection logic (e.g. the old "shortest possible clip"
+    # behavior) - it never triggers an automatic re-analysis. Re-running
+    # the paid Anthropic/ElevenLabs steps on an old job requires an
+    # explicit new job, not a silent upgrade of stale cached data.
+    analysis_version: int = 0
+
     def public_dict(self, download_urls: dict[str, str] | None = None) -> dict[str, Any]:
         download_urls = download_urls or {}
         return {
@@ -233,4 +244,5 @@ class Job(BaseModel):
             # web UI and MCP client use this to offer a "Retry render"
             # action that skips paying for AI analysis/TTS again.
             "resumable": self.ready_to_render and self.status == JobStatus.FAILED,
+            "analysis_version": self.analysis_version,
         }
