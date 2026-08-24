@@ -24,6 +24,21 @@ class NarrationCue(BaseModel):
     text: str
     start_seconds: float
     skip: bool = False
+    # Storage key of this cue's synthesized ElevenLabs narration audio,
+    # uploaded as soon as it's generated. Lets a render-only retry reuse the
+    # already-paid-for TTS audio instead of calling ElevenLabs again.
+    audio_storage_key: str | None = None
+
+
+class TranscriptWordRecord(BaseModel):
+    """Persisted form of app.pipeline.transcribe.TranscriptWord - saved on
+    the Job once transcription succeeds so a retry never has to call
+    ElevenLabs Scribe again."""
+
+    text: str
+    start: float
+    end: float
+    kind: str = "word"
 
 
 class ClipScores(BaseModel):
@@ -87,6 +102,16 @@ class Job(BaseModel):
     expires_at: float | None = None
     source_storage_key: str | None = None
 
+    # Set once transcription, Claude visual analysis, clip selection, story
+    # generation, and per-cue TTS have all completed successfully and been
+    # persisted (transcript_words below, and each clip's narration_cues with
+    # their audio_storage_key set). When true, a retry can skip straight to
+    # rendering - no Anthropic or ElevenLabs calls needed - re-rendering only
+    # the clips that don't have a storage_key yet (some may have already
+    # rendered successfully before a later clip's render failed).
+    ready_to_render: bool = False
+    transcript_words: list[TranscriptWordRecord] = Field(default_factory=list)
+
     def public_dict(self, download_urls: dict[str, str] | None = None) -> dict[str, Any]:
         download_urls = download_urls or {}
         return {
@@ -99,4 +124,8 @@ class Job(BaseModel):
             "clips": [c.to_output(download_urls.get(c.id)) for c in self.clips],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            # True once the job has saved analysis it can resume from - the
+            # web UI and MCP client use this to offer a "Retry render"
+            # action that skips paying for AI analysis/TTS again.
+            "resumable": self.ready_to_render and self.status == JobStatus.FAILED,
         }

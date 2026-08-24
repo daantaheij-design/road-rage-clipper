@@ -26,7 +26,10 @@ mcp = MCPServer(
         "Turns a road-rage / dashcam video into short vertical TikTok-style highlight clips with "
         "AI-selected moments, narration, and captions. Call create_road_rage_clips with a video URL "
         "to start a job, then poll get_clip_job with the returned job_id until status is 'completed' "
-        "or 'failed'. Processing takes several minutes; do not block waiting - check back later."
+        "or 'failed'. Processing takes several minutes; do not block waiting - check back later. If a "
+        "job fails, call retry_road_rage_job with the same job_id rather than starting a new job - if "
+        "the expensive AI analysis/narration steps already finished (get_clip_job reports "
+        "'resumable': true), retrying skips them and only redoes the failed step."
     ),
 )
 
@@ -63,6 +66,30 @@ async def get_clip_job(job_id: str) -> dict:
     if status is None:
         return {"error": f"No job found with id '{job_id}'"}
     return status
+
+
+@mcp.tool()
+async def retry_road_rage_job(job_id: str) -> dict:
+    """Retry a failed job started with create_road_rage_clips.
+
+    If transcription, visual analysis, clip selection, story generation, and narration TTS had
+    already completed successfully before the job failed (this is reported as `resumable: true`
+    by get_clip_job), the retry skips straight to rendering and does NOT call Anthropic or
+    ElevenLabs again - only the failed rendering step is redone. If the job failed before that
+    point, the retry starts over from the beginning.
+
+    Args:
+        job_id: The job_id of a job whose status is 'failed'.
+
+    Returns immediately with the job's new status - poll get_clip_job as usual to track progress.
+    """
+    try:
+        job = await job_service.retry_job(job_id)
+    except job_service.JobNotRetryableError as exc:
+        return {"error": str(exc)}
+    if job is None:
+        return {"error": f"No job found with id '{job_id}'"}
+    return {"job_id": job.id, "status": job.status.value}
 
 
 class _BearerAuthMiddleware:

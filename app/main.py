@@ -171,6 +171,16 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Job not found")
         return status
 
+    @app.post("/api/jobs/{job_id}/retry", dependencies=[Depends(require_api_auth)])
+    async def retry_job(job_id: str):
+        try:
+            job = await job_service.retry_job(job_id)
+        except job_service.JobNotRetryableError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        return {"job_id": job.id, "status": job.status.value}
+
     # -----------------------------------------------------------------
     # Signed local-storage file serving (only used when R2 isn't configured)
     # -----------------------------------------------------------------
