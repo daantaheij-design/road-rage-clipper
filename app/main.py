@@ -164,6 +164,13 @@ def create_app() -> FastAPI:
         enqueue_job(job.id)
         return {"job_id": job.id}
 
+    @app.get("/api/jobs", dependencies=[Depends(require_api_auth)])
+    async def list_jobs(limit: int = Query(10, ge=1, le=50)):
+        # Plain read of already-persisted job state - lets the /upload page
+        # restore whatever it was showing after a browser refresh without
+        # triggering any new download/transcription/analysis/render work.
+        return {"jobs": await job_service.list_recent_jobs(limit)}
+
     @app.get("/api/jobs/{job_id}", dependencies=[Depends(require_api_auth)])
     async def get_job(job_id: str):
         status = await job_service.get_job_status(job_id)

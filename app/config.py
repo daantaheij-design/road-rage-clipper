@@ -24,6 +24,17 @@ class Settings(BaseSettings):
     elevenlabs_stt_model: str = "scribe_v2"
     elevenlabs_tts_model: str = "eleven_multilingual_v2"
     elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
+    # Voice delivery, all tunable without a code change. Defaults aim for an
+    # energetic, expressive modern TikTok/Shorts narrator rather than a flat
+    # documentary/news-reader read: lower stability = more emotional
+    # range/less monotone, higher style = more exaggerated delivery, speed
+    # slightly above 1.0 = a touch of urgency without sounding rushed. Valid
+    # ranges follow ElevenLabs' voice_settings API (stability/similarity/style
+    # 0-1, speed roughly 0.7-1.2) - see app/pipeline/tts.py.
+    elevenlabs_voice_stability: float = 0.35
+    elevenlabs_voice_similarity: float = 0.8
+    elevenlabs_voice_style: float = 0.55
+    elevenlabs_voice_speed: float = 1.05
 
     # Storage
     r2_account_id: str = ""

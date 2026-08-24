@@ -29,10 +29,12 @@ import time
 from pathlib import Path
 
 from app.config import get_settings
-from app.jobs.models import Clip, ClipScores, Job, JobStatus, NarrationCue, TranscriptWordRecord
+from app.jobs.models import Clip, ClipScores, Job, JobStatus, NarrationCue, TranscriptWordRecord, WordTimingRecord
+from app.jobs.models import CropKeyframe as CropKeyframeRecord
 from app.jobs.store import get_job_store
 from app.pipeline import captions as captions_mod
 from app.pipeline import ffmpeg_utils, vision
+from app.pipeline.crop import CropKeyframe
 from app.pipeline.download import DownloadError, download_video
 from app.pipeline.render import NarrationTrack, render_vertical_clip
 from app.pipeline.scoring import select_clips
@@ -136,6 +138,12 @@ def _build_clip_from_analysis(analysis: vision.MomentAnalysis, clip_index: int) 
         end_seconds=analysis.end_seconds,
         duration_seconds=analysis.end_seconds - analysis.start_seconds,
         scores=ClipScores(**analysis.scores),
+        crop_keyframes=[
+            CropKeyframeRecord(
+                time_seconds=kf.time_seconds, focus_x=kf.focus_x, focus_y=kf.focus_y, confidence=kf.confidence
+            )
+            for kf in analysis.crop_keyframes
+        ],
         filename=f"road-rage-clip-{clip_index + 1}.mp4",
     )
 
@@ -153,14 +161,20 @@ async def _synthesize_and_store_narration(
         rel_start = max(0.0, min(clip.duration_seconds, cue.start_seconds))
         audio_path = clip_dir / f"narration_{i}.mp3"
         try:
-            await synthesize_narration(cue.text, audio_path)
+            narration_audio = await synthesize_narration(cue.text, audio_path)
         except Exception:
             logger.exception("narration synthesis failed for clip %s cue %d", clip.id, i)
             continue
         key = f"jobs/{job_id}/narration/{clip.id}/{i}.mp3"
         storage.upload_file(audio_path, key, content_type="audio/mpeg")
         clip.narration_cues.append(
-            NarrationCue(beat=cue.beat, text=cue.text, start_seconds=rel_start, audio_storage_key=key)
+            NarrationCue(
+                beat=cue.beat,
+                text=cue.text,
+                start_seconds=rel_start,
+                audio_storage_key=key,
+                word_timings=[WordTimingRecord(text=w.text, start=w.start, end=w.end) for w in narration_audio.words],
+            )
         )
 
 
@@ -199,11 +213,18 @@ async def _render_and_upload_clip(
     ]
     # clip.narration_cues and tracks are built/fetched in lockstep (same
     # order, same successfully-synthesized subset), so zipping them pairs
-    # each cue's text with its actual audio timing.
+    # each cue's text/word timings with its actual audio placement in the
+    # clip.
     narration_for_captions = [
         (track.start_seconds, track.start_seconds + track.duration_seconds, cue.text)
         for cue, track in zip(clip.narration_cues, tracks, strict=False)
     ]
+    narration_words = [
+        captions_mod.Word(text=w.text, start=track.start_seconds + w.start, end=track.start_seconds + w.end)
+        for cue, track in zip(clip.narration_cues, tracks, strict=False)
+        for w in cue.word_timings
+    ]
+    narration_words.sort(key=lambda w: w.start)
 
     ass_path = clip_dir / "captions.ass"
     captions_mod.build_ass_captions(
@@ -212,8 +233,14 @@ async def _render_and_upload_clip(
         clip_end=clip.end_seconds,
         transcript_words=words,
         narration_cues=narration_for_captions,
+        narration_words=narration_words,
         hook_text=clip.hook,
     )
+
+    crop_keyframes = [
+        CropKeyframe(time_seconds=kf.time_seconds, focus_x=kf.focus_x, focus_y=kf.focus_y, confidence=kf.confidence)
+        for kf in clip.crop_keyframes
+    ]
 
     output_path = clip_dir / "output.mp4"
     await render_vertical_clip(
@@ -224,6 +251,7 @@ async def _render_and_upload_clip(
         media_info=media_info,
         narration_tracks=tracks,
         captions_ass_path=ass_path,
+        crop_keyframes=crop_keyframes,
     )
 
     key = f"jobs/{job_id}/clips/{clip.id}.mp4"

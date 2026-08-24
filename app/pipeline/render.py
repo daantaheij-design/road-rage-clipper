@@ -1,10 +1,12 @@
 """Compose the final vertical (1080x1920) TikTok-ready clip.
 
-Layout: horizontal dashcam footage is never simply center-cropped (that
-would cut off cars at the frame edges). Instead the frame is placed in full
-inside the vertical canvas, scaled to fit, with a blurred/zoomed copy of the
-same frame filling the space above and below it - a common, readable
-"letterbox with blurred background" style.
+Layout: a true full-screen 9:16 crop (see app/pipeline/crop.py) - never a
+shrunk-down frame floating inside a blurred box. A vertical slice is cropped
+out of the horizontal source and, when Claude's visual analysis provided
+crop keyframes for this clip, panned smoothly over time to keep the
+important action (the car, the confrontation, whatever the analysis says
+matters) inside frame. No keyframes / low confidence -> a plain centered
+crop, still full-screen.
 
 Audio: the original clip audio plays throughout. While a narration cue is
 speaking, the original audio is ducked (lowered, not muted) so honking,
@@ -28,13 +30,9 @@ things kept early renders from OOM-killing the process (ffmpeg exits with
    fraction of the memory for a similar speed trade-off at low thread
    counts. `rc-lookahead` (frames buffered ahead for rate-control analysis,
    40 by default) is also capped.
-3. The background blur used to run gblur(sigma=20) at the full 1080x1920
-   output resolution - a large, slow, memory-heavy Gaussian blur. It now
-   crops to a small internal working resolution *first*, blurs that (with a
-   proportionally smaller sigma - blur radius scales with pixel size), and
-   only then scales back up to 1080x1920 for compositing. The output
-   resolution and visual result are unchanged; the blur just never
-   materializes a full-resolution intermediate frame.
+3. The smart-crop pan (crop.py) is a single `crop`+`scale` filter pair
+   operating directly at the target resolution - no extra full-resolution
+   intermediate frames, no per-pixel blur convolution.
 """
 
 from __future__ import annotations
@@ -43,22 +41,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import get_settings
-from app.pipeline.ffmpeg_utils import MediaInfo, escape_for_filter, run_ffmpeg
+from app.pipeline.crop import CropKeyframe, build_crop_filter
+from app.pipeline.ffmpeg_utils import MediaInfo, escape_for_filter, probe, run_ffmpeg
 
 TARGET_W = 1080
 TARGET_H = 1920
 DUCK_VOLUME = 0.35
 
-# The background copy is blurred at 1/4 resolution (270x480) rather than the
-# full 1080x1920 - a ~16x smaller frame for the expensive gblur step. Sigma
-# is scaled down to match (blur radius is relative to pixel size), then the
-# result is scaled back up to the full canvas. Visually indistinguishable
-# from blurring at full resolution (it's a soft background, not the subject)
-# but dramatically cheaper in both CPU and memory.
-BG_BLUR_SCALE_DIVISOR = 4
-BG_BLUR_W = TARGET_W // BG_BLUR_SCALE_DIVISOR
-BG_BLUR_H = TARGET_H // BG_BLUR_SCALE_DIVISOR
-BG_BLUR_SIGMA = 20 // BG_BLUR_SCALE_DIVISOR
+# How far the actual rendered duration is allowed to drift from the
+# requested clip length before we refuse to call the render successful. This
+# is the safety net that catches a repeat of the "exported the whole rest of
+# the source video" bug (see module docstring) even if some future change
+# reintroduces an ffmpeg option-ordering mistake.
+MAX_DURATION_DRIFT_SECONDS = 0.5
+
+
+class RenderValidationError(RuntimeError):
+    """Raised when a rendered clip's actual duration doesn't match what was
+    requested - never let a mis-trimmed render silently reach storage."""
+
 
 # x264 rate-control lookahead, in frames. Default is 40, which at 1080x1920
 # means dozens of full decoded frames buffered ahead of the encoder purely
@@ -83,6 +84,7 @@ async def render_vertical_clip(
     media_info: MediaInfo,
     narration_tracks: list[NarrationTrack] | None = None,
     captions_ass_path: Path | None = None,
+    crop_keyframes: list[CropKeyframe] | None = None,
     threads: int | None = None,
 ) -> Path:
     narration_tracks = narration_tracks or []
@@ -101,9 +103,18 @@ async def render_vertical_clip(
 
     args: list[str] = ["ffmpeg", "-y", "-threads", str(threads)]
 
-    # Main video/audio input, trimmed to the clip window. Input-side -ss is
-    # frame-accurate on modern ffmpeg and much faster than filter-based trim.
-    args += ["-ss", f"{start_seconds:.3f}", "-i", str(source_path), "-t", f"{duration:.3f}"]
+    # Main video/audio input, trimmed to the clip window. Both -ss and -t
+    # MUST come before this -i to be unambiguously scoped to this input -
+    # ffmpeg binds any option preceding an -i to that specific input, but an
+    # option placed *after* -i (and before the next -i) instead binds to
+    # whichever input comes next. With narration tracks (additional -i's
+    # follow), a `-t` placed after this -i silently became a duration limit
+    # on the *next* input (a narration mp3, already short enough that it had
+    # no visible effect) rather than on the source video - so the video
+    # decoded straight through to EOF with nothing capping it. Input-side
+    # duration here is also what keeps a 10-minute source from being fully
+    # decoded just to extract a 24-second window.
+    args += ["-ss", f"{start_seconds:.3f}", "-t", f"{duration:.3f}", "-i", str(source_path)]
 
     if not media_info.has_audio:
         # Silent source footage: synthesize a silent base track so narration
@@ -116,21 +127,31 @@ async def render_vertical_clip(
 
     filter_parts: list[str] = []
 
-    # ---- video: blurred-background vertical composition ----
-    # The background copy is scaled/cropped straight down to a small working
-    # resolution (BG_BLUR_W x BG_BLUR_H) - never materializing a full
-    # 1080x1920 frame before blurring - blurred there with a proportionally
-    # smaller sigma, then scaled back up to the full canvas. The foreground
-    # (the actual dashcam footage people need to read) is untouched, still
-    # scaled at full quality straight to fit the target canvas.
-    filter_parts.append(
-        f"[0:v]split=2[bg][fg];"
-        f"[bg]scale={BG_BLUR_W}:{BG_BLUR_H}:force_original_aspect_ratio=increase,"
-        f"crop={BG_BLUR_W}:{BG_BLUR_H},gblur=sigma={BG_BLUR_SIGMA},"
-        f"scale={TARGET_W}:{TARGET_H}:flags=bilinear,eq=brightness=-0.05[bgblur];"
-        f"[fg]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease[fgs];"
-        f"[bgblur][fgs]overlay=(W-w)/2:(H-h)/2:format=auto[vcomp]"
+    # ---- explicit trim, belt-and-suspenders against the clip-length bug ----
+    # The input-side -ss/-t above should already bound reading to exactly
+    # this window, but an explicit `trim`/`atrim` + PTS reset inside the
+    # filtergraph is immune to ffmpeg CLI option-ordering pitfalls entirely
+    # (this is what caused the original bug) and guarantees the frame/sample
+    # count actually fed into the rest of the graph never exceeds `duration`,
+    # regardless of how many more -i's or filters get added later.
+    filter_parts.append(f"[0:v]trim=duration={duration:.3f},setpts=PTS-STARTPTS[vtrim]")
+    audio_src_label = "0:a" if media_info.has_audio else "1:a"
+    filter_parts.append(f"[{audio_src_label}]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS[atrim]")
+
+    # ---- video: true full-screen 9:16 smart crop ----
+    # A single crop+scale pass that always fills the entire target canvas -
+    # panned over time to follow crop_keyframes (from Claude's visual
+    # analysis of this clip) when available, otherwise a static center crop.
+    # See app/pipeline/crop.py for the pan-smoothing/confidence logic.
+    crop_filter = build_crop_filter(
+        crop_keyframes or [],
+        clip_duration=duration,
+        source_width=media_info.width,
+        source_height=media_info.height,
+        target_width=TARGET_W,
+        target_height=TARGET_H,
     )
+    filter_parts.append(f"[vtrim]{crop_filter}[vcomp]")
     video_out_label = "vcomp"
     if captions_ass_path is not None:
         escaped = escape_for_filter(captions_ass_path)
@@ -138,13 +159,12 @@ async def render_vertical_clip(
         video_out_label = "vout"
 
     # ---- audio: duck original under narration, then mix narration in ----
-    audio_src_label = "0:a" if media_info.has_audio else "1:a"
     if narration_tracks:
         duck_chain = ",".join(
             f"volume=volume={DUCK_VOLUME}:enable='between(t,{t.start_seconds:.3f},{t.start_seconds + t.duration_seconds:.3f})'"
             for t in narration_tracks
         )
-        filter_parts.append(f"[{audio_src_label}]{duck_chain}[aduck]")
+        filter_parts.append(f"[atrim]{duck_chain}[aduck]")
 
         narration_labels = []
         for i, t in enumerate(narration_tracks):
@@ -161,7 +181,7 @@ async def render_vertical_clip(
         )
         filter_parts.append("[amixed]alimiter=limit=0.9[aout]")
     else:
-        filter_parts.append(f"[{audio_src_label}]anull[aout]")
+        filter_parts.append("[atrim]anull[aout]")
 
     filter_complex = ";".join(filter_parts)
 
@@ -206,8 +226,28 @@ async def render_vertical_clip(
         "44100",
         "-movflags",
         "+faststart",
+        # Third, redundant duration cap (input-side -ss/-t plus the
+        # trim/atrim filters above should already guarantee this) - an
+        # explicit output-side -t here as well is cheap insurance and is an
+        # unambiguous output option regardless of input count/ordering.
+        "-t",
+        f"{duration:.3f}",
         str(output_path),
     ]
 
     await run_ffmpeg(args, timeout=1800)
+
+    # Never let a mis-trimmed render (e.g. a future ffmpeg-option-ordering
+    # mistake like the one this function's docstring describes) reach
+    # storage looking successful. Verify the actual output against what was
+    # requested before returning.
+    actual_info = await probe(output_path)
+    drift = abs(actual_info.duration_seconds - duration)
+    if drift > MAX_DURATION_DRIFT_SECONDS:
+        raise RenderValidationError(
+            f"Rendered duration validation failed: expected {duration:.1f}s, got "
+            f"{actual_info.duration_seconds:.1f}s (source={source_path.name}, "
+            f"start={start_seconds:.1f}s, end={end_seconds:.1f}s)"
+        )
+
     return output_path

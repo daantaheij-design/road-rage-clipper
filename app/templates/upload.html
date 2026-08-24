@@ -59,13 +59,25 @@
   .clip-hook { font-style: italic; color: #e5c07b; font-size: 14px; margin: 0 0 8px; }
   .clip-explain { font-size: 14px; color: #cfcfd6; margin: 0 0 10px; }
   .clip-meta { font-size: 12px; color: #7d7d88; margin-bottom: 12px; }
-  a.download-btn {
-    display: block; text-align: center; padding: 13px; border-radius: 12px; background: #23232c;
-    color: #fff; font-weight: 700; text-decoration: none; font-size: 15px;
+  .clip-actions { display: flex; gap: 10px; }
+  a.download-btn, button.view-btn {
+    flex: 1; display: block; text-align: center; padding: 13px; border-radius: 12px; background: #23232c;
+    color: #fff; font-weight: 700; text-decoration: none; font-size: 15px; border: none; font-family: inherit;
   }
-  a.download-btn:active { opacity: 0.8; }
+  a.download-btn:active, button.view-btn:active { opacity: 0.8; }
+  button.view-btn:disabled { color: #6f6f7a; }
   footer { text-align: center; margin-top: 28px; }
   footer a { color: #6f6f7a; font-size: 13px; }
+  #view-modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 100;
+    display: flex; align-items: center; justify-content: center; flex-direction: column;
+    padding: max(20px, env(safe-area-inset-top)) 18px calc(20px + env(safe-area-inset-bottom));
+  }
+  #view-modal video { width: 100%; max-height: 80vh; border-radius: 12px; background: #000; }
+  #view-modal-close {
+    margin-top: 16px; padding: 12px 22px; border-radius: 12px; border: 1px solid #3a3a44;
+    background: #1c1c22; color: #fff; font-weight: 700; font-size: 15px;
+  }
 </style>
 </head>
 <body>
@@ -108,6 +120,11 @@
   <div id="results"></div>
 
   <footer><a href="#" id="logout-link">Log out</a></footer>
+
+  <div id="view-modal" class="hidden">
+    <video id="view-modal-video" controls playsinline></video>
+    <button type="button" id="view-modal-close">Close</button>
+  </div>
 
 <script>
 (function () {
@@ -157,6 +174,25 @@
     return m + ':' + String(r).padStart(2, '0');
   }
 
+  const viewModal = document.getElementById('view-modal');
+  const viewModalVideo = document.getElementById('view-modal-video');
+  const viewModalClose = document.getElementById('view-modal-close');
+
+  function openClipViewer(url) {
+    viewModalVideo.src = url;
+    viewModal.classList.remove('hidden');
+    viewModalVideo.play().catch(() => {});
+  }
+
+  function closeClipViewer() {
+    viewModal.classList.add('hidden');
+    viewModalVideo.pause();
+    viewModalVideo.removeAttribute('src');
+    viewModalVideo.load();
+  }
+
+  viewModalClose.addEventListener('click', closeClipViewer);
+
   function renderClips(clips) {
     results.innerHTML = '';
     clips.forEach((c, i) => {
@@ -164,8 +200,9 @@
       div.className = 'clip-card';
       const explain = c.explanation ? `<p class="clip-explain">${escapeHtml(c.explanation)}</p>` : '';
       const hook = c.hook ? `<p class="clip-hook">"${escapeHtml(c.hook)}"</p>` : '';
+      const viewBtn = `<button type="button" class="view-btn" ${c.download_url ? '' : 'disabled'}>▶️ View</button>`;
       const dl = c.download_url
-        ? `<a class="download-btn" href="${c.download_url}" download>⬇️ Download MP4</a>`
+        ? `<a class="download-btn" href="${c.download_url}" download>⬇️ Download</a>`
         : `<div class="hint">Rendering…</div>`;
       div.innerHTML = `
         <div class="clip-score">Score ${c.score}/100</div>
@@ -173,8 +210,11 @@
         ${hook}
         ${explain}
         <div class="clip-meta">${fmtTime(c.start_seconds)}–${fmtTime(c.end_seconds)} · ${Math.round(c.duration_seconds)}s</div>
-        ${dl}
+        <div class="clip-actions">${viewBtn}${dl}</div>
       `;
+      if (c.download_url) {
+        div.querySelector('.view-btn').addEventListener('click', () => openClipViewer(c.download_url));
+      }
       results.appendChild(div);
     });
   }
@@ -185,37 +225,70 @@
     return d.innerHTML;
   }
 
+  const ACTIVE_STATUSES = ['queued', 'downloading', 'transcribing', 'analyzing', 'rendering', 'uploading'];
+
+  function applyJobState(job) {
+    currentJobId = job.job_id;
+    progressCard.classList.remove('hidden');
+    progressBar.style.width = job.progress + '%';
+    statusMsg.textContent = job.message || job.status;
+    statusMsg.classList.toggle('error', job.status === 'failed');
+
+    if (job.clips && job.clips.length) renderClips(job.clips);
+
+    if (job.status === 'completed') {
+      if (pollTimer) clearInterval(pollTimer);
+      generateBtn.disabled = false;
+      generateBtn.textContent = 'Generate More Clips';
+      retryBtn.hidden = true;
+    } else if (job.status === 'failed') {
+      if (pollTimer) clearInterval(pollTimer);
+      generateBtn.disabled = false;
+      generateBtn.textContent = 'Start a New Job';
+      statusMsg.textContent = job.error || 'Something went wrong.';
+      retryBtn.hidden = false;
+      retryBtn.disabled = false;
+      retryBtn.textContent = job.resumable
+        ? '🔁 Retry rendering (reuses saved AI analysis, no extra AI cost)'
+        : '🔁 Retry';
+    } else {
+      retryBtn.hidden = true;
+      generateBtn.disabled = true;
+      generateBtn.textContent = 'Processing…';
+    }
+  }
+
   async function poll(jobId) {
     try {
       const res = await fetch(`/api/jobs/${jobId}`);
       if (!res.ok) throw new Error('status check failed');
       const job = await res.json();
-      progressBar.style.width = job.progress + '%';
-      statusMsg.textContent = job.message || job.status;
-      statusMsg.classList.toggle('error', job.status === 'failed');
-
-      if (job.clips && job.clips.length) renderClips(job.clips);
-
-      if (job.status === 'completed') {
-        clearInterval(pollTimer);
-        generateBtn.disabled = false;
-        generateBtn.textContent = 'Generate More Clips';
-        retryBtn.hidden = true;
-      } else if (job.status === 'failed') {
-        clearInterval(pollTimer);
-        generateBtn.disabled = false;
-        generateBtn.textContent = 'Start a New Job';
-        statusMsg.textContent = job.error || 'Something went wrong.';
-        retryBtn.hidden = false;
-        retryBtn.disabled = false;
-        retryBtn.textContent = job.resumable
-          ? '🔁 Retry rendering (reuses saved AI analysis, no extra AI cost)'
-          : '🔁 Retry';
-      } else {
-        retryBtn.hidden = true;
-      }
+      applyJobState(job);
     } catch (e) {
       // transient network hiccup - keep polling
+    }
+  }
+
+  // Jobs are persisted server-side (SQLite job store), not held only in
+  // page JS state - on load (including a plain Safari refresh mid-render)
+  // fetch the most recent job and restore exactly what was on screen
+  // before, resuming polling if it's still in progress. This is a
+  // read-only GET - it never re-triggers download/transcription/analysis/
+  // render work, even for a job that's mid-processing.
+  async function restoreLastJob() {
+    try {
+      const res = await fetch('/api/jobs?limit=1');
+      if (!res.ok) return;
+      const data = await res.json();
+      const job = (data.jobs || [])[0];
+      if (!job) return;
+      applyJobState(job);
+      if (ACTIVE_STATUSES.includes(job.status)) {
+        startPolling(job.job_id);
+      }
+    } catch (e) {
+      // no persisted job yet, or a transient network hiccup - fine, just
+      // show the normal empty form.
     }
   }
 
@@ -286,6 +359,8 @@
     await fetch('/logout', { method: 'POST' });
     window.location.href = '/login';
   });
+
+  restoreLastJob();
 })();
 </script>
 </body>

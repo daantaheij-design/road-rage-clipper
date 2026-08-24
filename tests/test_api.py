@@ -165,3 +165,41 @@ def test_job_status_reports_resumable_flag_when_failed_with_saved_analysis(clien
 
     resp = client.get(f"/api/jobs/{job.id}")
     assert resp.json()["resumable"] is True
+
+
+def test_list_jobs_requires_auth(client):
+    resp = client.get("/api/jobs")
+    assert resp.status_code == 401
+
+
+def test_list_jobs_returns_newest_first_without_touching_pipeline(client):
+    client.post("/login", data={"password": "testpass"})
+
+    older = Job(status=JobStatus.COMPLETED, created_at=1000.0)
+    newer = Job(status=JobStatus.RENDERING, created_at=2000.0, progress=42, message="Rendering clip 1 of 2")
+    _seed_job(older)
+    _seed_job(newer)
+
+    resp = client.get("/api/jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["jobs"]
+    job_ids = [j["job_id"] for j in jobs]
+    assert job_ids.index(newer.id) < job_ids.index(older.id)
+
+    # This is the "browser refresh must not re-trigger AI work" guarantee:
+    # a plain read must not change the still-processing job's state at all
+    # (no new status, no reset progress) - it's exactly what the store
+    # already had.
+    restored = next(j for j in jobs if j["job_id"] == newer.id)
+    assert restored["status"] == "rendering"
+    assert restored["progress"] == 42
+    assert restored["message"] == "Rendering clip 1 of 2"
+
+
+def test_list_jobs_respects_limit(client):
+    client.post("/login", data={"password": "testpass"})
+    for i in range(3):
+        _seed_job(Job(status=JobStatus.COMPLETED, created_at=float(i)))
+
+    resp = client.get("/api/jobs", params={"limit": 1})
+    assert len(resp.json()["jobs"]) == 1

@@ -17,6 +17,7 @@ import pytest
 from app.jobs.models import Job, JobStatus
 from app.jobs.store import get_job_store
 from app.pipeline import pipeline, vision
+from app.pipeline import tts as pipeline_tts
 from app.pipeline.ffmpeg_utils import Frame, MediaInfo
 from app.pipeline.transcribe import Transcript, TranscriptWord
 
@@ -84,6 +85,10 @@ class _Harness:
             self.calls["tts"] += 1
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(b"fake mp3 bytes")
+            return pipeline_tts.NarrationAudio(
+                audio_path=out_path,
+                words=[pipeline_tts.WordTiming(text=w, start=i * 0.3, end=i * 0.3 + 0.25) for i, w in enumerate(text.split())],
+            )
 
         async def fake_duration_of(path):
             return 2.0
@@ -97,6 +102,7 @@ class _Harness:
             media_info,
             narration_tracks=None,
             captions_ass_path=None,
+            crop_keyframes=None,
             threads=None,
         ):
             self.calls["render"] += 1

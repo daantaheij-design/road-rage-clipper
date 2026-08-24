@@ -19,6 +19,19 @@ class JobStatus(StrEnum):
     FAILED = "failed"
 
 
+class WordTimingRecord(BaseModel):
+    """Persisted per-word timing for one narration cue's synthesized audio
+    (from ElevenLabs' character-level alignment - see
+    app.pipeline.tts._characters_to_words). Relative to the start of that
+    cue's own audio clip, not the clip or the source video. Saved alongside
+    audio_storage_key so word-by-word captions survive a render-only retry
+    without ever calling ElevenLabs again."""
+
+    text: str
+    start: float
+    end: float
+
+
 class NarrationCue(BaseModel):
     beat: str  # hook | setup | escalation | main_event | payoff
     text: str
@@ -28,6 +41,17 @@ class NarrationCue(BaseModel):
     # uploaded as soon as it's generated. Lets a render-only retry reuse the
     # already-paid-for TTS audio instead of calling ElevenLabs again.
     audio_storage_key: str | None = None
+    word_timings: list[WordTimingRecord] = Field(default_factory=list)
+
+
+class CropKeyframe(BaseModel):
+    """One point in a clip's smart-crop pan plan - see app/pipeline/crop.py.
+    time_seconds is relative to the clip's own start (0 = clip start)."""
+
+    time_seconds: float
+    focus_x: float = 0.5
+    focus_y: float = 0.5
+    confidence: float = 0.0
 
 
 class TranscriptWordRecord(BaseModel):
@@ -69,6 +93,7 @@ class Clip(BaseModel):
     duration_seconds: float = 0
     scores: ClipScores = Field(default_factory=ClipScores)
     narration_cues: list[NarrationCue] = Field(default_factory=list)
+    crop_keyframes: list[CropKeyframe] = Field(default_factory=list)
     storage_key: str | None = None
     filename: str | None = None
 

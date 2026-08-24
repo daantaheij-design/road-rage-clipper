@@ -82,6 +82,14 @@ class NarrationCueDraft:
 
 
 @dataclass
+class CropKeyframeDraft:
+    time_seconds: float  # relative to the clip's own start (0 = clip start)
+    focus_x: float
+    focus_y: float
+    confidence: float
+
+
+@dataclass
 class MomentAnalysis:
     is_moment: bool
     title: str
@@ -91,6 +99,7 @@ class MomentAnalysis:
     scores: dict[str, int]
     hook_text: str
     narration_cues: list[NarrationCueDraft]
+    crop_keyframes: list[CropKeyframeDraft] = field(default_factory=list)
 
     @property
     def total_score(self) -> int:
@@ -141,7 +150,13 @@ _ANALYZE_TOOL = {
                 "type": "boolean",
                 "description": "False if on closer inspection this is not actually an interesting moment.",
             },
-            "title": {"type": "string", "description": "Short internal title, e.g. 'Highway cutoff and brake check'."},
+            "title": {
+                "type": "string",
+                "description": (
+                    "Short internal/descriptive title, e.g. 'Highway cutoff and brake check'. This CAN summarize "
+                    "the incident - it is never shown as the hook."
+                ),
+            },
             "explanation": {
                 "type": "string",
                 "description": "2-4 sentences describing what visibly happens, in order. Observable facts only.",
@@ -159,6 +174,16 @@ _ANALYZE_TOOL = {
             },
             "scores": {
                 "type": "object",
+                "description": (
+                    "Score each dimension 0-10; they sum to a 0-100 total. Calibrate against real TikTok/Shorts "
+                    "retention, not against how 'newsworthy' the incident is: 0-40 ordinary/boring (nothing here "
+                    "should be selected), 40-60 some activity but a weak social clip, 60-75 interesting, 75-85 a "
+                    "strong TikTok candidate, 85-95 an excellent incident with real retention potential, 95+ a "
+                    "rare exceptional moment. Strong VISUAL action (a near-miss, an aggressive cut-off, someone "
+                    "getting out of a car, a burnout) can score highly even with little or no dialogue - do not "
+                    "undervalue a visually dramatic moment just because nobody is talking, and do not overvalue "
+                    "a moment just because there's a lot of talking with little happening on screen."
+                ),
                 "properties": {dim: {"type": "integer", "minimum": 0, "maximum": 10} for dim in SCORE_DIMENSIONS},
                 "required": SCORE_DIMENSIONS,
                 "additionalProperties": False,
@@ -166,17 +191,27 @@ _ANALYZE_TOOL = {
             "hook_text": {
                 "type": "string",
                 "description": (
-                    "One punchy on-screen hook sentence (<=12 words) that creates curiosity without spoiling the "
-                    "payoff. Original, based on this specific footage - do not reuse generic stock phrases."
+                    "The ON-SCREEN hook text card shown at the very start of the clip (<=12 words). This is a "
+                    "CURIOSITY HOOK, not a summary or title: it must make the viewer want to keep watching to "
+                    "find out what happens, WITHOUT revealing the incident or the payoff. Never a description of "
+                    "the action (bad: 'Motorcycle squeezes past a car mid-bridge'; that's a title, not a hook). "
+                    "Never generic clickbait like 'watch until the end' or 'you won't believe this'. Write an "
+                    "original hook in your own words based on this specific footage - vary the phrasing/angle "
+                    "clip to clip, don't reuse a formula."
                 ),
             },
             "narration_cues": {
                 "type": "array",
                 "description": (
-                    "Up to 5 short narration lines, one per story beat (hook, setup, escalation, main_event, "
-                    "payoff). Set skip=true for beats where the original audio/video already tells the story and "
-                    "narration would just talk over important reactions, honking, or arguments - do not narrate "
-                    "the whole clip."
+                    "Up to 5 short SPOKEN narration lines, one per story beat (hook, setup, escalation, "
+                    "main_event, payoff). The 'hook' cue is the voiceover version of the hook - it can differ "
+                    "slightly in wording from hook_text since it's spoken aloud, not read, but must follow the "
+                    "same curiosity-not-summary rule and be 6-14 words (~2-4 seconds spoken). Write for expressive "
+                    "delivery: short sentences, contractions, natural spoken rhythm, occasional emphasis (e.g. "
+                    "capitalize ONE word you want stressed) - this is read by an energetic TikTok-style narrator, "
+                    "not a news anchor. Set skip=true for beats where the original audio/video already tells the "
+                    "story and narration would just talk over important reactions, honking, or arguments - do "
+                    "not narrate the whole clip, let the footage breathe."
                 ),
                 "items": {
                     "type": "object",
@@ -193,6 +228,45 @@ _ANALYZE_TOOL = {
                     "additionalProperties": False,
                 },
             },
+            "crop_keyframes": {
+                "type": "array",
+                "description": (
+                    "2-6 points tracking where the important vehicle/action is horizontally and vertically in "
+                    "frame over the course of the clip, used to pan a full-screen vertical (9:16) crop so the "
+                    "action stays visible instead of being center-cropped out. time_seconds is relative to the "
+                    "CLIP start you chose above (0 = clip start), matching narration_cues. Provide at least a "
+                    "point near the start and one near the end; add more if the action moves across the frame "
+                    "(e.g. a car drifting from center to the right edge). If you aren't confident where in frame "
+                    "the action is at a given moment, either omit that point or give it low confidence - a wrong "
+                    "confident guess is worse than no guess."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "time_seconds": {"type": "number"},
+                        "focus_x": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                            "description": "Normalized horizontal position of the important action, 0=left edge, 0.5=center, 1=right edge.",
+                        },
+                        "focus_y": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                            "description": "Normalized vertical position, 0=top edge, 0.5=center, 1=bottom edge.",
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                            "description": "How sure you are of this position. Below ~0.5 it will be treated as unreliable and ignored in favor of a centered crop.",
+                        },
+                    },
+                    "required": ["time_seconds", "focus_x", "focus_y", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
         },
         "required": [
             "is_moment",
@@ -203,6 +277,7 @@ _ANALYZE_TOOL = {
             "scores",
             "hook_text",
             "narration_cues",
+            "crop_keyframes",
         ],
         "additionalProperties": False,
     },
@@ -251,15 +326,18 @@ async def scan_for_candidates(
 
     system = (
         "You are helping a private individual review their own road/dashcam footage to find "
-        "moments worth turning into short highlight clips: cars cutting each other off, dangerous "
-        "overtakes, sudden braking, apparent brake checks, drivers getting out of their cars, "
-        "arguments, gestures, honking, near collisions, blocking another vehicle, aggressive "
-        "driving, unexpected escalation, funny or dramatic reactions, or a clear setup-and-payoff "
-        "moment. You are shown a sparse sequence of low-resolution frames sampled roughly every "
-        "1-2 seconds, each labelled with its timestamp, plus the transcript for that stretch if "
-        "there is speech. This is only a coarse first pass to flag windows for closer review - "
-        "bias toward flagging anything plausibly interesting rather than being sure. "
-        + OBSERVABLE_ONLY_RULE
+        "genuinely entertaining moments worth turning into short, high-retention TikTok/Shorts-style "
+        "highlight clips - not a traffic-incident report. Look for: close calls, cutting off, "
+        "aggressive merging, sudden braking, apparent brake checks, dangerous overtakes, motorcycles "
+        "squeezing through impossibly tight gaps, confrontations, drivers exiting their vehicles, "
+        "gestures, arguments, honking, burnouts/smoke, crashes or near-crashes, unexpected escalation, "
+        "funny or shocked reactions, unusual behavior, or anything with a clear visual payoff. Strong "
+        "VISUAL action alone is enough to flag something - do not wait for dialogue or narration "
+        "before flagging a visually striking moment. You are shown a sparse sequence of low-resolution "
+        "frames sampled roughly every 1-2 seconds, each labelled with its timestamp, plus the "
+        "transcript for that stretch if there is speech. This is only a coarse first pass to flag "
+        "windows for closer review - bias toward flagging anything plausibly interesting rather than "
+        "being sure. " + OBSERVABLE_ONLY_RULE
     )
 
     batches = _batches(frames, PASS1_BATCH_SIZE, PASS1_BATCH_OVERLAP)
@@ -351,14 +429,22 @@ async def analyze_candidate(
     system = (
         "You are analyzing one specific moment from a private individual's own road/dashcam "
         "footage in detail, to decide whether it's worth a vertical short-form highlight clip and "
-        "to help write a short factual story about it. You are shown a dense sequence of frames "
-        "(several per second) covering this moment and its immediate surroundings, each labelled "
-        "with its absolute timestamp in the source video, plus the spoken transcript nearby. "
-        + OBSERVABLE_ONLY_RULE
-        + " Prefer a clip with an understandable beginning (what led to it), middle (the incident), "
-        "and end (how it resolved or the reaction to it) - include a few seconds of lead-in before "
-        "the incident itself rather than starting exactly on the action. Target a total clip length "
-        "of 25-60 seconds, and only go up to about 90 seconds if the story genuinely needs it."
+        "to help write a short factual story about it. This should feel like a fast, visual, "
+        "curiosity-driven TikTok/Shorts edit - not an AI news report, documentary, or traffic-safety "
+        "analysis. You are shown a dense sequence of frames (several per second) covering this "
+        "moment and its immediate surroundings, each labelled with its absolute timestamp in the "
+        "source video, plus the spoken transcript nearby. " + OBSERVABLE_ONLY_RULE + " Be honest about "
+        "quality: if this moment is genuinely weak (ordinary traffic, no real action, nothing "
+        "surprising), set is_moment to false rather than inflating scores to justify a mediocre clip - "
+        "a private individual would rather get one excellent clip than several forgettable ones.\n\n"
+        "CLIP LENGTH: choose the SHORTEST duration that still delivers a setup, the event/escalation, "
+        "and a payoff - do not stretch a short incident to hit a target length. Preferred range is "
+        "roughly 8-45 seconds; go longer (up to ~90s) only when the story genuinely needs it, and "
+        "shorter (down to ~6s) is fine for a single sharp moment. Cut dead time aggressively - a few "
+        "seconds of lead-in for context is good, ten seconds of nothing happening is not. Still "
+        "include a few seconds of lead-in before the incident itself rather than starting exactly on "
+        "the action, and let it play out to a natural end (resolution or reaction) rather than cutting "
+        "off mid-beat."
     )
 
     content: list[dict] = [
@@ -399,6 +485,20 @@ async def analyze_candidate(
         for c in result.get("narration_cues", [])
     ]
 
+    crop_keyframes: list[CropKeyframeDraft] = []
+    for kf in result.get("crop_keyframes", []):
+        try:
+            crop_keyframes.append(
+                CropKeyframeDraft(
+                    time_seconds=float(kf["time_seconds"]),
+                    focus_x=float(kf["focus_x"]),
+                    focus_y=float(kf["focus_y"]),
+                    confidence=float(kf["confidence"]),
+                )
+            )
+        except (KeyError, ValueError, TypeError):
+            continue
+
     try:
         start_seconds = float(result["start_seconds"])
         end_seconds = float(result["end_seconds"])
@@ -414,4 +514,5 @@ async def analyze_candidate(
         scores=scores,
         hook_text=str(result.get("hook_text", "")),
         narration_cues=cues,
+        crop_keyframes=crop_keyframes,
     )
